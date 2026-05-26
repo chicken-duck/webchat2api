@@ -36,10 +36,35 @@ def create_router() -> APIRouter:
     @router.get("/api/image-tasks")
     async def list_image_tasks(
         ids: str = Query(default=""),
+        all: bool = Query(default=False),
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
+        if all and identity.get("role") == "admin":
+            return await run_in_threadpool(image_task_service.list_all_tasks, identity)
         return await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids))
+    
+    @router.post("/api/image-tasks/{task_id}/cancel")
+    async def cancel_image_task(
+        task_id: str,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            return await run_in_threadpool(image_task_service.cancel_task, identity, task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    
+    @router.post("/api/image-tasks/{task_id}/retry")
+    async def retry_image_task(
+        task_id: str,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            return await run_in_threadpool(image_task_service.retry_task, identity, task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.post("/api/image-tasks/generations")
     async def create_generation_task(

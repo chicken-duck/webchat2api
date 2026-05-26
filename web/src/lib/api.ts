@@ -208,7 +208,7 @@ export type ImageResponse = {
 
 export type ImageTask = {
   id: string;
-  status: "queued" | "running" | "success" | "error";
+  status: "queued" | "running" | "success" | "error" | "cancelled";
   mode: "generate" | "edit";
   model?: ImageModel;
   size?: string;
@@ -216,6 +216,7 @@ export type ImageTask = {
   updated_at: string;
   data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
   error?: string;
+  prompt?: string;
 };
 
 type ImageTaskListResponse = {
@@ -463,12 +464,23 @@ export async function createImageEditTask(
   });
 }
 
-export async function fetchImageTasks(ids: string[]) {
+export async function fetchImageTasks(ids: string[], all = false) {
   const params = new URLSearchParams();
   if (ids.length > 0) {
     params.set("ids", ids.join(","));
   }
+  if (all) {
+    params.set("all", "true");
+  }
   return httpRequest<ImageTaskListResponse>(`/api/image-tasks${params.toString() ? `?${params.toString()}` : ""}`);
+}
+
+export async function cancelImageTask(taskId: string) {
+  return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" });
+}
+
+export async function retryImageTask(taskId: string) {
+  return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/retry`, { method: "POST" });
 }
 
 export async function fetchSettingsConfig() {

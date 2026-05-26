@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
-from services.image_task_service import ImageTaskService
+from services.image_task_service import ImageTaskService, TASK_STATUS_CANCELLED
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -120,6 +120,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                                 "status": "queued",
                                 "mode": "generate",
                                 "model": "gpt-image-2",
+                                "prompt": "test",
+                                "base_url": "http://test",
                                 "created_at": "2099-01-01 00:00:00",
                                 "updated_at": "2099-01-01 00:00:00",
                             },
@@ -129,6 +131,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                                 "status": "running",
                                 "mode": "generate",
                                 "model": "gpt-image-2",
+                                "prompt": "test",
+                                "base_url": "http://test",
                                 "created_at": "2099-01-01 00:00:00",
                                 "updated_at": "2099-01-01 00:00:00",
                             },
@@ -143,6 +147,147 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual([item["status"] for item in result["items"]], ["error", "error"])
             self.assertTrue(all("已中断" in item.get("error", "") for item in result["items"]))
+
+    def test_cancel_task_marks_as_cancelled(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            service = self.make_service(path)
+            
+            service.submit_generation(
+                OWNER,
+                client_task_id="cancel-test",
+                prompt="cancel me",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            
+            # 立即取消
+            cancelled = service.cancel_task(OWNER, "cancel-test")
+            self.assertEqual(cancelled["status"], TASK_STATUS_CANCELLED)
+            
+            result = service.list_tasks(OWNER, ["cancel-test"])
+            self.assertEqual(result["items"][0]["status"], TASK_STATUS_CANCELLED)
+    
+    def test_retry_failed_task(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            
+            calls = 0
+            def failing_then_succeeding(_payload):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise ValueError("first attempt fails")
+                return {"data": [{"url": "http://example.test/retry.png"}]}
+            
+            service = self.make_service(path, failing_then_succeeding)
+            
+            # 第一次提交应该失败
+            service.submit_generation(
+                OWNER,
+                client_task_id="retry-test",
+                prompt="retry me",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            wait_for_task(service, OWNER, "retry-test", "error")
+            self.assertEqual(calls, 1)
+            
+            # 重试任务
+            retried = service.retry_task(OWNER, "retry-test")
+            self.assertEqual(retried["status"], "queued")
+            
+            # 等待第二次尝试成功
+            task = wait_for_task(service, OWNER, "retry-test", "success")
+            self.assertEqual(task["data"][0]["url"], "http://example.test/retry.png")
+            self.assertEqual(calls, 2)
+    
+    def test_cannot_retry_running_task(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            
+            def slow_handler(_payload):
+                time.sleep(0.5)
+                return {"data": [{"url": "http://example.test/image.png"}]}
+            
+            service = self.make_service(path, slow_handler)
+            
+            service.submit_generation(
+                OWNER,
+                client_task_id="no-retry-running",
+                prompt="test",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            
+            with self.assertRaises(ValueError):
+                service.retry_task(OWNER, "no-retry-running")
+    
+    def test_cannot_cancel_already_completed_task(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            service = self.make_service(path)
+            
+            service.submit_generation(
+                OWNER,
+                client_task_id="no-cancel-complete",
+                prompt="test",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            wait_for_task(service, OWNER, "no-cancel-complete", "success")
+            
+            with self.assertRaises(ValueError):
+                service.cancel_task(OWNER, "no-cancel-complete")
+    
+    def test_task_persists_cancelled_status(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            service = self.make_service(path)
+            
+            service.submit_generation(
+                OWNER,
+                client_task_id="persist-cancel",
+                prompt="test",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            service.cancel_task(OWNER, "persist-cancel")
+            
+            reloaded = self.make_service(path)
+            result = reloaded.list_tasks(OWNER, ["persist-cancel"])
+            
+            self.assertEqual(result["items"][0]["status"], TASK_STATUS_CANCELLED)
+    
+    def test_list_all_tasks_for_admin(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            service = self.make_service(path)
+            
+            service.submit_generation(
+                OWNER,
+                client_task_id="task-1",
+                prompt="test 1",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            service.submit_generation(
+                OTHER_OWNER,
+                client_task_id="task-2",
+                prompt="test 2",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            
+            all_tasks = service.list_all_tasks(OWNER)
+            self.assertEqual(len(all_tasks["items"]), 2)
 
 
 if __name__ == "__main__":

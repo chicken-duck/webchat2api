@@ -17,7 +17,8 @@ TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
-TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
+TASK_STATUS_CANCELLED = "cancelled"
+TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELLED}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 
 
@@ -93,6 +94,7 @@ class ImageTaskService:
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._cancelled_tasks: set[str] = set()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
@@ -119,7 +121,7 @@ class ImageTaskService:
             "response_format": "url",
             "base_url": base_url,
         }
-        return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
+        return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload, prompt=prompt)
 
     def submit_edit(
         self,
@@ -141,7 +143,75 @@ class ImageTaskService:
             "response_format": "url",
             "base_url": base_url,
         }
-        return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
+        return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload, prompt=prompt)
+    
+    def cancel_task(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        owner = _owner_id(identity)
+        key = _task_key(owner, task_id)
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("Task not found")
+            if task["status"] not in UNFINISHED_STATUSES:
+                raise ValueError("Only queued or running tasks can be cancelled")
+            
+            task["status"] = TASK_STATUS_CANCELLED
+            task["updated_at"] = _now_iso()
+            task["error"] = "Cancelled by user"
+            self._cancelled_tasks.add(key)
+            self._save_locked()
+            return _public_task(task)
+    
+    def retry_task(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        owner = _owner_id(identity)
+        key = _task_key(owner, task_id)
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("Task not found")
+            if task["status"] not in (TASK_STATUS_ERROR, TASK_STATUS_CANCELLED):
+                raise ValueError("Only failed or cancelled tasks can be retried")
+            
+            # 检查是否有足够的信息进行重试
+            if "mode" not in task or "prompt" not in task:
+                raise ValueError("Task does not have sufficient information to retry")
+            
+            # 重置任务状态
+            task["status"] = TASK_STATUS_QUEUED
+            task["updated_at"] = _now_iso()
+            task["error"] = ""
+            task["data"] = None
+            
+            # 准备重新提交任务
+            mode = task["mode"]
+            model = task.get("model", "gpt-image-2")
+            size = task.get("size")
+            prompt = task["prompt"]
+            base_url = task.get("base_url", "")
+            # 保存任务，让我们可以重新启动它
+            self._save_locked()
+            
+        # 重新启动任务（我们需要重建 payload）
+        # 注意：对于编辑任务，我们无法恢复原始图像数据，但我们可以尝试
+        payload = {
+            "prompt": prompt,
+            "model": model,
+            "n": 1,
+            "size": size,
+            "response_format": "url",
+            "base_url": base_url,
+        }
+        
+        # 如果是编辑任务，我们需要额外的处理，但我们已经保存了基本信息
+        # 现在我们手动启动任务
+        thread = threading.Thread(
+            target=self._run_task,
+            args=(key, mode, payload, dict(identity), model),
+            name=f"image-task-retry-{task_id[:16]}",
+            daemon=True,
+        )
+        thread.start()
+        return _public_task(task)
 
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         owner = _owner_id(identity)
@@ -174,6 +244,7 @@ class ImageTaskService:
         client_task_id: str,
         mode: str,
         payload: dict[str, Any],
+        prompt: str,
     ) -> dict[str, Any]:
         task_id = _clean(client_task_id)
         if not task_id:
@@ -196,6 +267,8 @@ class ImageTaskService:
                 "mode": mode,
                 "model": _clean(payload.get("model"), "gpt-image-2"),
                 "size": _clean(payload.get("size")),
+                "prompt": prompt,
+                "base_url": payload.get("base_url", ""),
                 "created_at": now,
                 "updated_at": now,
             }
@@ -221,11 +294,27 @@ class ImageTaskService:
         identity: dict[str, object],
         model: str,
     ) -> None:
+        # 检查任务是否已取消
+        with self._lock:
+            if key in self._cancelled_tasks:
+                return
+        
         started = time.time()
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
         try:
+            # 再次检查任务是否已取消
+            with self._lock:
+                if key in self._cancelled_tasks:
+                    return
+                
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload)
+            
+            # 再次检查任务是否已取消
+            with self._lock:
+                if key in self._cancelled_tasks:
+                    return
+                
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
@@ -247,6 +336,11 @@ class ImageTaskService:
                 urls=_collect_image_urls(data),
             )
         except Exception as exc:
+            # 检查任务是否因取消而失败
+            with self._lock:
+                if key in self._cancelled_tasks:
+                    return
+            
             error_message = str(exc) or "image task failed"
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[])
             self._log_call(
@@ -325,7 +419,7 @@ class ImageTaskService:
             if not task_id or not owner:
                 continue
             status = _clean(item.get("status"))
-            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}:
+            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELLED}:
                 status = TASK_STATUS_ERROR
             task = {
                 "id": task_id,
@@ -334,6 +428,8 @@ class ImageTaskService:
                 "mode": "edit" if item.get("mode") == "edit" else "generate",
                 "model": _clean(item.get("model"), "gpt-image-2"),
                 "size": _clean(item.get("size")),
+                "prompt": _clean(item.get("prompt")),
+                "base_url": _clean(item.get("base_url")),
                 "created_at": _clean(item.get("created_at"), _now_iso()),
                 "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
             }
@@ -345,6 +441,16 @@ class ImageTaskService:
                 task["error"] = error
             tasks[_task_key(owner, task_id)] = task
         return tasks
+    
+    def list_all_tasks(self, identity: dict[str, object]) -> dict[str, Any]:
+        """列出所有任务（用于管理员）"""
+        owner = _owner_id(identity)
+        with self._lock:
+            if self._cleanup_locked():
+                self._save_locked()
+            items = [_public_task(task) for task in self._tasks.values()]
+            items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+            return {"items": items}
 
     def _save_locked(self) -> None:
         items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)

@@ -14,6 +14,7 @@ import { clearStoredAuthSession, type StoredAuthSession } from "@/store/auth";
 const adminNavItems = [
   { href: "/image", label: "试验" },
   { href: "/accounts", label: "号池管理" },
+  { href: "/image-tasks", label: "任务管理" },
   { href: "/image-manager", label: "图片管理" },
   { href: "/logs", label: "日志管理" },
   { href: "/settings", label: "设置" },
