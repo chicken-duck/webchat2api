@@ -29,6 +29,8 @@ class FakeImageTaskService:
     def __init__(self):
         self.generation_calls = []
         self.edit_calls = []
+        self.cancel_calls = []
+        self.retry_calls = []
 
     def submit_generation(self, identity, **kwargs):
         self.generation_calls.append((identity, kwargs))
@@ -66,6 +68,27 @@ class FakeImageTaskService:
                 if task_id != "missing"
             ],
             "missing_ids": [task_id for task_id in ids if task_id == "missing"],
+        }
+
+    def cancel_task(self, identity, task_id):
+        self.cancel_calls.append((identity, task_id))
+        return {
+            "id": task_id,
+            "status": "cancelled",
+            "mode": "generate",
+            "error": "任务已取消",
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00",
+        }
+
+    def retry_task(self, identity, task_id, base_url):
+        self.retry_calls.append((identity, task_id, base_url))
+        return {
+            "id": task_id,
+            "status": "queued",
+            "mode": "generate",
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00",
         }
 
 
@@ -135,6 +158,24 @@ class ImageTasksApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual([item["id"] for item in payload["items"]], ["task-1"])
         self.assertEqual(payload["missing_ids"], ["missing"])
+
+    def test_cancel_task(self):
+        response = self.client.post("/api/image-tasks/task-1/cancel", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["status"], "cancelled")
+        self.assertEqual(len(self.fake_service.cancel_calls), 1)
+        self.assertEqual(self.fake_service.cancel_calls[0][1], "task-1")
+
+    def test_retry_task(self):
+        response = self.client.post("/api/image-tasks/task-1/retry", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["status"], "queued")
+        self.assertEqual(len(self.fake_service.retry_calls), 1)
+        self.assertEqual(self.fake_service.retry_calls[0][1], "task-1")
 
 
 if __name__ == "__main__":

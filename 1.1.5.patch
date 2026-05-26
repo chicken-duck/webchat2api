@@ -1,0 +1,709 @@
+diff --git a/api/image_tasks.py b/api/image_tasks.py
+index 76c3f97..1d97094 100644
+--- a/api/image_tasks.py
++++ b/api/image_tasks.py
+@@ -90,4 +90,32 @@ def create_router() -> APIRouter:
+         except ValueError as exc:
+             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+ 
++    @router.post("/api/image-tasks/{task_id}/cancel")
++    async def cancel_image_task(
++        task_id: str,
++        authorization: str | None = Header(default=None),
++    ):
++        identity = require_identity(authorization)
++        try:
++            return await run_in_threadpool(image_task_service.cancel_task, identity, task_id)
++        except ValueError as exc:
++            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
++
++    @router.post("/api/image-tasks/{task_id}/retry")
++    async def retry_image_task(
++        task_id: str,
++        request: Request,
++        authorization: str | None = Header(default=None),
++    ):
++        identity = require_identity(authorization)
++        try:
++            return await run_in_threadpool(
++                image_task_service.retry_task,
++                identity,
++                task_id,
++                resolve_image_base_url(request),
++            )
++        except ValueError as exc:
++            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
++
+     return router
+diff --git a/services/image_task_service.py b/services/image_task_service.py
+index 352a3a4..0bd2a89 100644
+--- a/services/image_task_service.py
++++ b/services/image_task_service.py
+@@ -17,7 +17,8 @@ TASK_STATUS_QUEUED = "queued"
+ TASK_STATUS_RUNNING = "running"
+ TASK_STATUS_SUCCESS = "success"
+ TASK_STATUS_ERROR = "error"
+-TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
++TASK_STATUS_CANCELLED = "cancelled"
++TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELLED}
+ UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+ 
+ 
+@@ -71,6 +72,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
+         "created_at": task.get("created_at"),
+         "updated_at": task.get("updated_at"),
+     }
++    if task.get("prompt"):
++        item["prompt"] = task.get("prompt")
+     if task.get("data") is not None:
+         item["data"] = task.get("data")
+     if task.get("error"):
+@@ -167,6 +170,53 @@ class ImageTaskService:
+                 missing_ids = []
+             return {"items": items, "missing_ids": missing_ids}
+ 
++    def cancel_task(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
++        owner = _owner_id(identity)
++        key = _task_key(owner, task_id)
++        with self._lock:
++            task = self._tasks.get(key)
++            if task is None:
++                raise ValueError("task not found")
++            if task.get("status") not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}:
++                raise ValueError(f"cannot cancel task in {task.get('status')} status")
++            task["status"] = TASK_STATUS_CANCELLED
++            task["error"] = "任务已取消"
++            task["updated_at"] = _now_iso()
++            self._save_locked()
++            return _public_task(task)
++
++    def retry_task(self, identity: dict[str, object], task_id: str, base_url: str) -> dict[str, Any]:
++        owner = _owner_id(identity)
++        key = _task_key(owner, task_id)
++        with self._lock:
++            task = self._tasks.get(key)
++            if task is None:
++                raise ValueError("task not found")
++            if task.get("status") != TASK_STATUS_ERROR and task.get("status") != TASK_STATUS_CANCELLED:
++                raise ValueError(f"cannot retry task in {task.get('status')} status")
++            task["status"] = TASK_STATUS_QUEUED
++            task["error"] = ""
++            task["data"] = None
++            task["updated_at"] = _now_iso()
++            self._save_locked()
++            mode = task.get("mode", "generate")
++            payload = {
++                "prompt": task.get("prompt", ""),
++                "model": task.get("model", "gpt-image-2"),
++                "n": 1,
++                "size": task.get("size"),
++                "response_format": "url",
++                "base_url": base_url,
++            }
++            thread = threading.Thread(
++                target=self._run_task,
++                args=(key, mode, payload, dict(identity), task.get("model", "gpt-image-2")),
++                name=f"image-task-retry-{task_id[:16]}",
++                daemon=True,
++            )
++            thread.start()
++            return _public_task(task)
++
+     def _submit(
+         self,
+         identity: dict[str, object],
+@@ -198,6 +248,7 @@ class ImageTaskService:
+                 "size": _clean(payload.get("size")),
+                 "created_at": now,
+                 "updated_at": now,
++                "prompt": _clean(payload.get("prompt")),
+             }
+             self._tasks[key] = task
+             self._save_locked()
+@@ -325,7 +376,7 @@ class ImageTaskService:
+             if not task_id or not owner:
+                 continue
+             status = _clean(item.get("status"))
+-            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}:
++            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELLED}:
+                 status = TASK_STATUS_ERROR
+             task = {
+                 "id": task_id,
+@@ -334,6 +385,7 @@ class ImageTaskService:
+                 "mode": "edit" if item.get("mode") == "edit" else "generate",
+                 "model": _clean(item.get("model"), "gpt-image-2"),
+                 "size": _clean(item.get("size")),
++                "prompt": _clean(item.get("prompt")),
+                 "created_at": _clean(item.get("created_at"), _now_iso()),
+                 "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
+             }
+diff --git a/test/test_image_task_service.py b/test/test_image_task_service.py
+index 566db0f..7ff8302 100644
+--- a/test/test_image_task_service.py
++++ b/test/test_image_task_service.py
+@@ -144,6 +144,223 @@ class ImageTaskServiceTests(unittest.TestCase):
+             self.assertEqual([item["status"] for item in result["items"]], ["error", "error"])
+             self.assertTrue(all("已中断" in item.get("error", "") for item in result["items"]))
+ 
++    def test_cancel_queued_task(self):
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            path = Path(tmp_dir) / "image_tasks.json"
++
++            def slow_handler(_payload):
++                time.sleep(5)
++                return {"data": [{"url": "http://example.test/image.png"}]}
++
++            service = self.make_service(path, handler=slow_handler)
++            service.submit_generation(
++                OWNER,
++                client_task_id="cancel-queued",
++                prompt="cancel me",
++                model="gpt-image-2",
++                size=None,
++                base_url="http://local.test",
++            )
++
++            result = service.cancel_task(OWNER, "cancel-queued")
++            self.assertEqual(result["status"], "cancelled")
++            self.assertEqual(result["error"], "任务已取消")
++
++            list_result = service.list_tasks(OWNER, ["cancel-queued"])
++            self.assertEqual(list_result["items"][0]["status"], "cancelled")
++
++    def test_cancel_running_task(self):
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            path = Path(tmp_dir) / "image_tasks.json"
++
++            def slow_handler(_payload):
++                time.sleep(5)
++                return {"data": [{"url": "http://example.test/image.png"}]}
++
++            service = self.make_service(path, handler=slow_handler)
++            service.submit_generation(
++                OWNER,
++                client_task_id="cancel-running",
++                prompt="cancel me running",
++                model="gpt-image-2",
++                size=None,
++                base_url="http://local.test",
++            )
++            wait_for_task(service, OWNER, "cancel-running", "running")
++
++            result = service.cancel_task(OWNER, "cancel-running")
++            self.assertEqual(result["status"], "cancelled")
++
++            list_result = service.list_tasks(OWNER, ["cancel-running"])
++            self.assertEqual(list_result["items"][0]["status"], "cancelled")
++
++    def test_cannot_cancel_success_task(self):
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
++            service.submit_generation(
++                OWNER,
++                client_task_id="done-task",
++                prompt="done",
++                model="gpt-image-2",
++                size=None,
++                base_url="http://local.test",
++            )
++            wait_for_task(service, OWNER, "done-task", "success")
++
++            with self.assertRaises(ValueError) as ctx:
++                service.cancel_task(OWNER, "done-task")
++            self.assertIn("cannot cancel task in success status", str(ctx.exception))
++
++    def test_cannot_cancel_nonexistent_task(self):
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
++            with self.assertRaises(ValueError) as ctx:
++                service.cancel_task(OWNER, "nonexistent")
++            self.assertIn("task not found", str(ctx.exception))
++
++    def test_retry_error_task(self):
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            path = Path(tmp_dir) / "image_tasks.json"
++            call_count = 0
++
++            def flaky_handler(_payload):
++                nonlocal call_count
++                call_count += 1
++                if call_count == 1:
++                    raise RuntimeError("first attempt fails")
++                return {"data": [{"url": "http://example.test/retry.png"}]}
++
++            service = self.make_service(path, handler=flaky_handler)
++            service.submit_generation(
++                OWNER,
++                client_task_id="retry-error",
++                prompt="retry me",
++                model="gpt-image-2",
++                size=None,
++                base_url="http://local.test",
++            )
++            wait_for_task(service, OWNER, "retry-error", "error")
++
++            result = service.retry_task(OWNER, "retry-error", "http://local.test")
++            self.assertEqual(result["status"], "queued")
++
++            final = wait_for_task(service, OWNER, "retry-error", "success")
++            self.assertEqual(final["data"][0]["url"], "http://example.test/retry.png")
++            self.assertEqual(call_count, 2)
++
++    def test_retry_cancelled_task(self):
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            path = Path(tmp_dir) / "image_tasks.json"
++
++            def slow_handler(_payload):
++                time.sleep(5)
++                return {"data": [{"url": "http://example.test/image.png"}]}
++
++            service = self.make_service(path, handler=slow_handler)
++            service.submit_generation(
++                OWNER,
++                client_task_id="retry-cancelled",
++                prompt="retry after cancel",
++                model="gpt-image-2",
++                size=None,
++                base_url="http://local.test",
++            )
++            service.cancel_task(OWNER, "retry-cancelled")
++
++            result = service.retry_task(OWNER, "retry-cancelled", "http://local.test")
++            self.assertEqual(result["status"], "queued")
++
++    def test_cannot_retry_running_task(self):
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            path = Path(tmp_dir) / "image_tasks.json"
++
++            def slow_handler(_payload):
++                time.sleep(5)
++                return {"data": [{"url": "http://example.test/image.png"}]}
++
++            service = self.make_service(path, handler=slow_handler)
++            service.submit_generation(
++                OWNER,
++                client_task_id="no-retry-running",
++                prompt="running",
++                model="gpt-image-2",
++                size=None,
++                base_url="http://local.test",
++            )
++            wait_for_task(service, OWNER, "no-retry-running", "running")
++
++            with self.assertRaises(ValueError) as ctx:
++                service.retry_task(OWNER, "no-retry-running", "http://local.test")
++            self.assertIn("cannot retry task in running status", str(ctx.exception))
++
++    def test_cancelled_task_persists_across_restarts(self):
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            path = Path(tmp_dir) / "image_tasks.json"
++
++            def slow_handler(_payload):
++                time.sleep(5)
++                return {"data": [{"url": "http://example.test/image.png"}]}
++
++            service = self.make_service(path, handler=slow_handler)
++            service.submit_generation(
++                OWNER,
++                client_task_id="persist-cancelled",
++                prompt="cancel persist",
++                model="gpt-image-2",
++                size=None,
++                base_url="http://local.test",
++            )
++            service.cancel_task(OWNER, "persist-cancelled")
++
++            reloaded = self.make_service(path)
++            result = reloaded.list_tasks(OWNER, ["persist-cancelled"])
++            self.assertEqual(result["items"][0]["status"], "cancelled")
++
++    def test_cancelled_not_recovered_on_startup(self):
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            path = Path(tmp_dir) / "image_tasks.json"
++            path.write_text(
++                json.dumps(
++                    {
++                        "tasks": [
++                            {
++                                "id": "cancelled-task",
++                                "owner_id": "owner-1",
++                                "status": "cancelled",
++                                "mode": "generate",
++                                "model": "gpt-image-2",
++                                "prompt": "test prompt",
++                                "created_at": "2099-01-01 00:00:00",
++                                "updated_at": "2099-01-01 00:00:00",
++                            },
++                        ]
++                    }
++                ),
++                encoding="utf-8",
++            )
++
++            service = self.make_service(path)
++            result = service.list_tasks(OWNER, ["cancelled-task"])
++
++            self.assertEqual(result["items"][0]["status"], "cancelled")
++            self.assertNotIn("已中断", result["items"][0].get("error", ""))
++
++    def test_task_stores_prompt(self):
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
++            service.submit_generation(
++                OWNER,
++                client_task_id="prompt-task",
++                prompt="a beautiful sunset",
++                model="gpt-image-2",
++                size="1024x1024",
++                base_url="http://local.test",
++            )
++            wait_for_task(service, OWNER, "prompt-task", "success")
++
++            result = service.list_tasks(OWNER, ["prompt-task"])
++            self.assertEqual(result["items"][0].get("prompt"), "a beautiful sunset")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test/test_image_tasks_api.py b/test/test_image_tasks_api.py
+index 9566fb7..b6af0b4 100644
+--- a/test/test_image_tasks_api.py
++++ b/test/test_image_tasks_api.py
+@@ -29,6 +29,8 @@ class FakeImageTaskService:
+     def __init__(self):
+         self.generation_calls = []
+         self.edit_calls = []
++        self.cancel_calls = []
++        self.retry_calls = []
+ 
+     def submit_generation(self, identity, **kwargs):
+         self.generation_calls.append((identity, kwargs))
+@@ -68,6 +70,27 @@ class FakeImageTaskService:
+             "missing_ids": [task_id for task_id in ids if task_id == "missing"],
+         }
+ 
++    def cancel_task(self, identity, task_id):
++        self.cancel_calls.append((identity, task_id))
++        return {
++            "id": task_id,
++            "status": "cancelled",
++            "mode": "generate",
++            "error": "任务已取消",
++            "created_at": "2026-01-01 00:00:00",
++            "updated_at": "2026-01-01 00:00:00",
++        }
++
++    def retry_task(self, identity, task_id, base_url):
++        self.retry_calls.append((identity, task_id, base_url))
++        return {
++            "id": task_id,
++            "status": "queued",
++            "mode": "generate",
++            "created_at": "2026-01-01 00:00:00",
++            "updated_at": "2026-01-01 00:00:00",
++        }
++
+ 
+ class ImageTasksApiTests(unittest.TestCase):
+     def setUp(self):
+@@ -136,6 +159,24 @@ class ImageTasksApiTests(unittest.TestCase):
+         self.assertEqual([item["id"] for item in payload["items"]], ["task-1"])
+         self.assertEqual(payload["missing_ids"], ["missing"])
+ 
++    def test_cancel_task(self):
++        response = self.client.post("/api/image-tasks/task-1/cancel", headers=AUTH_HEADERS)
++
++        self.assertEqual(response.status_code, 200, response.text)
++        payload = response.json()
++        self.assertEqual(payload["status"], "cancelled")
++        self.assertEqual(len(self.fake_service.cancel_calls), 1)
++        self.assertEqual(self.fake_service.cancel_calls[0][1], "task-1")
++
++    def test_retry_task(self):
++        response = self.client.post("/api/image-tasks/task-1/retry", headers=AUTH_HEADERS)
++
++        self.assertEqual(response.status_code, 200, response.text)
++        payload = response.json()
++        self.assertEqual(payload["status"], "queued")
++        self.assertEqual(len(self.fake_service.retry_calls), 1)
++        self.assertEqual(self.fake_service.retry_calls[0][1], "task-1")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/web/src/app/image-manager/page.tsx b/web/src/app/image-manager/page.tsx
+index aa754d7..9c83509 100644
+--- a/web/src/app/image-manager/page.tsx
++++ b/web/src/app/image-manager/page.tsx
+@@ -1,7 +1,7 @@
+ "use client";
+ 
+ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+-import { CalendarDays, ChevronLeft, ChevronRight, Copy, Download, ImageIcon, LoaderCircle, Maximize2, Plus, RefreshCw, Search, Tag, Trash2, X } from "lucide-react";
++import { CalendarDays, ChevronLeft, ChevronRight, Copy, Download, ImageIcon, LoaderCircle, Maximize2, Plus, RefreshCw, Search, Tag, Trash2, X, Ban, RotateCcw } from "lucide-react";
+ import { toast } from "sonner";
+ 
+ import { DateRangeFilter } from "@/components/date-range-filter";
+@@ -13,7 +13,7 @@ import { Checkbox } from "@/components/ui/checkbox";
+ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+ import { Input } from "@/components/ui/input";
+ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+-import { deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageTags, fetchManagedImages, setImageTags, type ManagedImage } from "@/lib/api";
++import { cancelImageTask, deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageTags, fetchImageTasks, fetchManagedImages, retryImageTask, setImageTags, type ImageTask, type ManagedImage } from "@/lib/api";
+ import { useAuthGuard } from "@/lib/use-auth-guard";
+ 
+ const LONG_PRESS_MS = 800;
+@@ -67,6 +67,7 @@ function useLongPress(onLongPress: () => void, ms = LONG_PRESS_MS) {
+ }
+ 
+ function ImageManagerContent() {
++  const [activeTab, setActiveTab] = useState<"images" | "tasks">("images");
+   const [items, setItems] = useState<ManagedImage[]>([]);
+   const [startDate, setStartDate] = useState("");
+   const [endDate, setEndDate] = useState("");
+@@ -85,6 +86,9 @@ function ImageManagerContent() {
+   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+   const [deleteMode, setDeleteMode] = useState<"selected" | "filtered" | null>(null);
+   const [isDownloading, setIsDownloading] = useState(false);
++  const [tasks, setTasks] = useState<ImageTask[]>([]);
++  const [isLoadingTasks, setIsLoadingTasks] = useState(false);
++  const [taskActionLoading, setTaskActionLoading] = useState<Record<string, string | null>>({});
+ 
+   const filteredItems = selectedTags.length > 0
+     ? items.filter((item) => selectedTags.every((t) => (item.tags ?? []).includes(t)))
+@@ -261,6 +265,56 @@ function ImageManagerContent() {
+     await downloadSingleImage(item.rel);
+   };
+ 
++  const loadTasks = async () => {
++    setIsLoadingTasks(true);
++    try {
++      const data = await fetchImageTasks([]);
++      setTasks(data.items);
++    } catch (error) {
++      toast.error(error instanceof Error ? error.message : "加载任务失败");
++    } finally {
++      setIsLoadingTasks(false);
++    }
++  };
++
++  const handleCancelTask = async (task: ImageTask) => {
++    setTaskActionLoading((prev) => ({ ...prev, [task.id]: "cancel" }));
++    try {
++      await cancelImageTask(task.id);
++      toast.success("任务已取消");
++      await loadTasks();
++    } catch (error) {
++      toast.error(error instanceof Error ? error.message : "取消任务失败");
++    } finally {
++      setTaskActionLoading((prev) => ({ ...prev, [task.id]: null }));
++    }
++  };
++
++  const handleRetryTask = async (task: ImageTask) => {
++    setTaskActionLoading((prev) => ({ ...prev, [task.id]: "retry" }));
++    try {
++      await retryImageTask(task.id);
++      toast.success("任务已重试");
++      await loadTasks();
++    } catch (error) {
++      toast.error(error instanceof Error ? error.message : "重试任务失败");
++    } finally {
++      setTaskActionLoading((prev) => ({ ...prev, [task.id]: null }));
++    }
++  };
++
++  const statusBadge = (status: ImageTask["status"]) => {
++    const map: Record<string, { label: string; className: string }> = {
++      queued: { label: "排队中", className: "border-blue-200 bg-blue-50 text-blue-700" },
++      running: { label: "运行中", className: "border-amber-200 bg-amber-50 text-amber-700" },
++      success: { label: "成功", className: "border-green-200 bg-green-50 text-green-700" },
++      error: { label: "失败", className: "border-red-200 bg-red-50 text-red-700" },
++      cancelled: { label: "已取消", className: "border-stone-200 bg-stone-100 text-stone-500" },
++    };
++    const badge = map[status] || { label: status, className: "border-stone-200 bg-stone-50 text-stone-500" };
++    return <Badge variant="outline" className={`rounded-md px-2 py-0 text-[10px] ${badge.className}`}>{badge.label}</Badge>;
++  };
++
+   useEffect(() => {
+     void loadImages();
+   }, [startDate, endDate]);
+@@ -272,22 +326,129 @@ function ImageManagerContent() {
+           <div className="text-xs font-semibold tracking-[0.18em] text-stone-500 uppercase">Images</div>
+           <h1 className="text-2xl font-semibold tracking-tight">图片管理</h1>
+         </div>
+-        <div className="flex flex-wrap gap-2">
+-          <DateRangeFilter startDate={startDate} endDate={endDate} onChange={(start, end) => { setStartDate(start); setEndDate(end); }} />
+-          <Button variant="outline" onClick={clearFilters} className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700">
+-            清除筛选条件
+-          </Button>
+-          <Button onClick={() => void loadImages()} disabled={isLoading} className="h-10 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800">
+-            {isLoading ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}
+-            查询
+-          </Button>
+-          <Button variant="outline" onClick={() => setDeleteMode("filtered")} disabled={isDeleting || items.length === 0 || (!startDate && !endDate)} className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50">
+-            <Trash2 className="size-4" />
+-            删除匹配日期
+-          </Button>
++        <div className="flex flex-wrap items-center gap-2">
++          <div className="inline-flex rounded-lg border border-stone-200 bg-white p-1">
++            <button
++              type="button"
++              onClick={() => setActiveTab("images")}
++              className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${activeTab === "images" ? "bg-stone-900 text-white" : "text-stone-600 hover:bg-stone-50"}`}
++            >
++              图片管理
++            </button>
++            <button
++              type="button"
++              onClick={() => { setActiveTab("tasks"); void loadTasks(); }}
++              className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${activeTab === "tasks" ? "bg-stone-900 text-white" : "text-stone-600 hover:bg-stone-50"}`}
++            >
++              任务管理
++            </button>
++          </div>
++          {activeTab === "images" && (
++            <>
++              <DateRangeFilter startDate={startDate} endDate={endDate} onChange={(start, end) => { setStartDate(start); setEndDate(end); }} />
++              <Button variant="outline" onClick={clearFilters} className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700">
++                清除筛选条件
++              </Button>
++              <Button onClick={() => void loadImages()} disabled={isLoading} className="h-10 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800">
++                {isLoading ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}
++                查询
++              </Button>
++              <Button variant="outline" onClick={() => setDeleteMode("filtered")} disabled={isDeleting || items.length === 0 || (!startDate && !endDate)} className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50">
++                <Trash2 className="size-4" />
++                删除匹配日期
++              </Button>
++            </>
++          )}
++          {activeTab === "tasks" && (
++            <Button onClick={() => void loadTasks()} disabled={isLoadingTasks} className="h-10 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800">
++              {isLoadingTasks ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
++              刷新任务
++            </Button>
++          )}
+         </div>
+       </div>
+ 
++      {activeTab === "tasks" ? (
++        <Card className="overflow-hidden rounded-[26px] border-white/80 bg-white/86 shadow-[var(--shadow-soft)]">
++          <CardContent className="p-0">
++            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-100 px-5 py-4">
++              <div className="flex flex-wrap items-center gap-3 text-sm text-stone-600">
++                <ImageIcon className="size-4" />
++                共 {tasks.length} 个任务
++              </div>
++              <div className="flex items-center gap-2">
++                <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadTasks()} disabled={isLoadingTasks}>
++                  <RefreshCw className={`size-4 ${isLoadingTasks ? "animate-spin" : ""}`} />
++                  刷新
++                </Button>
++              </div>
++            </div>
++            <div className="divide-y divide-stone-100">
++              {tasks.map((task) => (
++                <div key={task.id} className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
++                  <div className="min-w-0 flex-1 space-y-1">
++                    <div className="flex flex-wrap items-center gap-2">
++                      <span className="truncate font-mono text-xs text-stone-500">{task.id}</span>
++                      {statusBadge(task.status)}
++                      <Badge variant="outline" className="rounded-md px-2 py-0 text-[10px] border-violet-200 bg-violet-50 text-violet-700">
++                        {task.mode === "edit" ? "图生图" : "文生图"}
++                      </Badge>
++                    </div>
++                    {task.prompt ? (
++                      <div className="truncate text-xs text-stone-600" title={task.prompt}>{task.prompt}</div>
++                    ) : null}
++                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-stone-400">
++                      <span>模型: {task.model || "-"}</span>
++                      {task.size ? <span>尺寸: {task.size}</span> : null}
++                      <span>创建: {task.created_at}</span>
++                      <span>更新: {task.updated_at}</span>
++                    </div>
++                    {task.error ? (
++                      <div className="truncate text-xs text-red-500" title={task.error}>{task.error}</div>
++                    ) : null}
++                  </div>
++                  <div className="flex items-center gap-2 shrink-0">
++                    {(task.status === "queued" || task.status === "running") && (
++                      <Button
++                        variant="outline"
++                        size="sm"
++                        className="h-8 rounded-lg border-amber-200 bg-white px-3 text-amber-600 hover:bg-amber-50"
++                        onClick={() => void handleCancelTask(task)}
++                        disabled={taskActionLoading[task.id] !== null}
++                      >
++                        {taskActionLoading[task.id] === "cancel" ? (
++                          <LoaderCircle className="mr-1 size-3.5 animate-spin" />
++                        ) : (
++                          <Ban className="mr-1 size-3.5" />
++                        )}
++                        取消
++                      </Button>
++                    )}
++                    {(task.status === "error" || task.status === "cancelled") && (
++                      <Button
++                        variant="outline"
++                        size="sm"
++                        className="h-8 rounded-lg border-blue-200 bg-white px-3 text-blue-600 hover:bg-blue-50"
++                        onClick={() => void handleRetryTask(task)}
++                        disabled={taskActionLoading[task.id] !== null}
++                      >
++                        {taskActionLoading[task.id] === "retry" ? (
++                          <LoaderCircle className="mr-1 size-3.5 animate-spin" />
++                        ) : (
++                          <RotateCcw className="mr-1 size-3.5" />
++                        )}
++                        重试
++                      </Button>
++                    )}
++                  </div>
++                </div>
++              ))}
++            </div>
++            {!isLoadingTasks && tasks.length === 0 ? <div className="px-6 py-14 text-center text-sm text-stone-500">暂无任务</div> : null}
++          </CardContent>
++        </Card>
++      ) : null}
++
+       {allTags.length > 0 ? (
+         <div className="flex flex-wrap items-center gap-2">
+           <span className="text-xs font-medium text-stone-500">
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index ab2431f..1f6b8ab 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -208,10 +208,11 @@ export type ImageResponse = {
+ 
+ export type ImageTask = {
+   id: string;
+-  status: "queued" | "running" | "success" | "error";
++  status: "queued" | "running" | "success" | "error" | "cancelled";
+   mode: "generate" | "edit";
+   model?: ImageModel;
+   size?: string;
++  prompt?: string;
+   created_at: string;
+   updated_at: string;
+   data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+@@ -471,6 +472,18 @@ export async function fetchImageTasks(ids: string[]) {
+   return httpRequest<ImageTaskListResponse>(`/api/image-tasks${params.toString() ? `?${params.toString()}` : ""}`);
+ }
+ 
++export async function cancelImageTask(taskId: string) {
++  return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/cancel`, {
++    method: "POST",
++  });
++}
++
++export async function retryImageTask(taskId: string) {
++  return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/retry`, {
++    method: "POST",
++  });
++}
++
+ export async function fetchSettingsConfig() {
+   return httpRequest<{ config: SettingsConfig }>("/api/settings");
+ }

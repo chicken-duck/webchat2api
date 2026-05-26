@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CalendarDays, ChevronLeft, ChevronRight, Copy, Download, ImageIcon, LoaderCircle, Maximize2, Plus, RefreshCw, Search, Tag, Trash2, X } from "lucide-react";
+import { CalendarDays, ChevronLeft, ChevronRight, Copy, Download, ImageIcon, LoaderCircle, Maximize2, Plus, RefreshCw, Search, Tag, Trash2, X, Ban, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 
 import { DateRangeFilter } from "@/components/date-range-filter";
@@ -13,7 +13,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageTags, fetchManagedImages, setImageTags, type ManagedImage } from "@/lib/api";
+import { cancelImageTask, deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageTags, fetchImageTasks, fetchManagedImages, retryImageTask, setImageTags, type ImageTask, type ManagedImage } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LONG_PRESS_MS = 800;
@@ -67,6 +67,7 @@ function useLongPress(onLongPress: () => void, ms = LONG_PRESS_MS) {
 }
 
 function ImageManagerContent() {
+  const [activeTab, setActiveTab] = useState<"images" | "tasks">("images");
   const [items, setItems] = useState<ManagedImage[]>([]);
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
@@ -85,6 +86,9 @@ function ImageManagerContent() {
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [deleteMode, setDeleteMode] = useState<"selected" | "filtered" | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
+  const [tasks, setTasks] = useState<ImageTask[]>([]);
+  const [isLoadingTasks, setIsLoadingTasks] = useState(false);
+  const [taskActionLoading, setTaskActionLoading] = useState<Record<string, string | null>>({});
 
   const filteredItems = selectedTags.length > 0
     ? items.filter((item) => selectedTags.every((t) => (item.tags ?? []).includes(t)))
@@ -261,6 +265,56 @@ function ImageManagerContent() {
     await downloadSingleImage(item.rel);
   };
 
+  const loadTasks = async () => {
+    setIsLoadingTasks(true);
+    try {
+      const data = await fetchImageTasks([]);
+      setTasks(data.items);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "加载任务失败");
+    } finally {
+      setIsLoadingTasks(false);
+    }
+  };
+
+  const handleCancelTask = async (task: ImageTask) => {
+    setTaskActionLoading((prev) => ({ ...prev, [task.id]: "cancel" }));
+    try {
+      await cancelImageTask(task.id);
+      toast.success("任务已取消");
+      await loadTasks();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "取消任务失败");
+    } finally {
+      setTaskActionLoading((prev) => ({ ...prev, [task.id]: null }));
+    }
+  };
+
+  const handleRetryTask = async (task: ImageTask) => {
+    setTaskActionLoading((prev) => ({ ...prev, [task.id]: "retry" }));
+    try {
+      await retryImageTask(task.id);
+      toast.success("任务已重试");
+      await loadTasks();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "重试任务失败");
+    } finally {
+      setTaskActionLoading((prev) => ({ ...prev, [task.id]: null }));
+    }
+  };
+
+  const statusBadge = (status: ImageTask["status"]) => {
+    const map: Record<string, { label: string; className: string }> = {
+      queued: { label: "排队中", className: "border-blue-200 bg-blue-50 text-blue-700" },
+      running: { label: "运行中", className: "border-amber-200 bg-amber-50 text-amber-700" },
+      success: { label: "成功", className: "border-green-200 bg-green-50 text-green-700" },
+      error: { label: "失败", className: "border-red-200 bg-red-50 text-red-700" },
+      cancelled: { label: "已取消", className: "border-stone-200 bg-stone-100 text-stone-500" },
+    };
+    const badge = map[status] || { label: status, className: "border-stone-200 bg-stone-50 text-stone-500" };
+    return <Badge variant="outline" className={`rounded-md px-2 py-0 text-[10px] ${badge.className}`}>{badge.label}</Badge>;
+  };
+
   useEffect(() => {
     void loadImages();
   }, [startDate, endDate]);
@@ -272,21 +326,128 @@ function ImageManagerContent() {
           <div className="text-xs font-semibold tracking-[0.18em] text-stone-500 uppercase">Images</div>
           <h1 className="text-2xl font-semibold tracking-tight">图片管理</h1>
         </div>
-        <div className="flex flex-wrap gap-2">
-          <DateRangeFilter startDate={startDate} endDate={endDate} onChange={(start, end) => { setStartDate(start); setEndDate(end); }} />
-          <Button variant="outline" onClick={clearFilters} className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700">
-            清除筛选条件
-          </Button>
-          <Button onClick={() => void loadImages()} disabled={isLoading} className="h-10 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800">
-            {isLoading ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}
-            查询
-          </Button>
-          <Button variant="outline" onClick={() => setDeleteMode("filtered")} disabled={isDeleting || items.length === 0 || (!startDate && !endDate)} className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50">
-            <Trash2 className="size-4" />
-            删除匹配日期
-          </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex rounded-lg border border-stone-200 bg-white p-1">
+            <button
+              type="button"
+              onClick={() => setActiveTab("images")}
+              className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${activeTab === "images" ? "bg-stone-900 text-white" : "text-stone-600 hover:bg-stone-50"}`}
+            >
+              图片管理
+            </button>
+            <button
+              type="button"
+              onClick={() => { setActiveTab("tasks"); void loadTasks(); }}
+              className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${activeTab === "tasks" ? "bg-stone-900 text-white" : "text-stone-600 hover:bg-stone-50"}`}
+            >
+              任务管理
+            </button>
+          </div>
+          {activeTab === "images" && (
+            <>
+              <DateRangeFilter startDate={startDate} endDate={endDate} onChange={(start, end) => { setStartDate(start); setEndDate(end); }} />
+              <Button variant="outline" onClick={clearFilters} className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700">
+                清除筛选条件
+              </Button>
+              <Button onClick={() => void loadImages()} disabled={isLoading} className="h-10 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800">
+                {isLoading ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}
+                查询
+              </Button>
+              <Button variant="outline" onClick={() => setDeleteMode("filtered")} disabled={isDeleting || items.length === 0 || (!startDate && !endDate)} className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50">
+                <Trash2 className="size-4" />
+                删除匹配日期
+              </Button>
+            </>
+          )}
+          {activeTab === "tasks" && (
+            <Button onClick={() => void loadTasks()} disabled={isLoadingTasks} className="h-10 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800">
+              {isLoadingTasks ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+              刷新任务
+            </Button>
+          )}
         </div>
       </div>
+
+      {activeTab === "tasks" ? (
+        <Card className="overflow-hidden rounded-[26px] border-white/80 bg-white/86 shadow-[var(--shadow-soft)]">
+          <CardContent className="p-0">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-100 px-5 py-4">
+              <div className="flex flex-wrap items-center gap-3 text-sm text-stone-600">
+                <ImageIcon className="size-4" />
+                共 {tasks.length} 个任务
+              </div>
+              <div className="flex items-center gap-2">
+                <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadTasks()} disabled={isLoadingTasks}>
+                  <RefreshCw className={`size-4 ${isLoadingTasks ? "animate-spin" : ""}`} />
+                  刷新
+                </Button>
+              </div>
+            </div>
+            <div className="divide-y divide-stone-100">
+              {tasks.map((task) => (
+                <div key={task.id} className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="truncate font-mono text-xs text-stone-500">{task.id}</span>
+                      {statusBadge(task.status)}
+                      <Badge variant="outline" className="rounded-md px-2 py-0 text-[10px] border-violet-200 bg-violet-50 text-violet-700">
+                        {task.mode === "edit" ? "图生图" : "文生图"}
+                      </Badge>
+                    </div>
+                    {task.prompt ? (
+                      <div className="truncate text-xs text-stone-600" title={task.prompt}>{task.prompt}</div>
+                    ) : null}
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-stone-400">
+                      <span>模型: {task.model || "-"}</span>
+                      {task.size ? <span>尺寸: {task.size}</span> : null}
+                      <span>创建: {task.created_at}</span>
+                      <span>更新: {task.updated_at}</span>
+                    </div>
+                    {task.error ? (
+                      <div className="truncate text-xs text-red-500" title={task.error}>{task.error}</div>
+                    ) : null}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {(task.status === "queued" || task.status === "running") && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-8 rounded-lg border-amber-200 bg-white px-3 text-amber-600 hover:bg-amber-50"
+                        onClick={() => void handleCancelTask(task)}
+                        disabled={taskActionLoading[task.id] !== null}
+                      >
+                        {taskActionLoading[task.id] === "cancel" ? (
+                          <LoaderCircle className="mr-1 size-3.5 animate-spin" />
+                        ) : (
+                          <Ban className="mr-1 size-3.5" />
+                        )}
+                        取消
+                      </Button>
+                    )}
+                    {(task.status === "error" || task.status === "cancelled") && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-8 rounded-lg border-blue-200 bg-white px-3 text-blue-600 hover:bg-blue-50"
+                        onClick={() => void handleRetryTask(task)}
+                        disabled={taskActionLoading[task.id] !== null}
+                      >
+                        {taskActionLoading[task.id] === "retry" ? (
+                          <LoaderCircle className="mr-1 size-3.5 animate-spin" />
+                        ) : (
+                          <RotateCcw className="mr-1 size-3.5" />
+                        )}
+                        重试
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+            {!isLoadingTasks && tasks.length === 0 ? <div className="px-6 py-14 text-center text-sm text-stone-500">暂无任务</div> : null}
+          </CardContent>
+        </Card>
+      ) : null}
 
       {allTags.length > 0 ? (
         <div className="flex flex-wrap items-center gap-2">

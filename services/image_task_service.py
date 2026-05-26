@@ -17,7 +17,8 @@ TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
-TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
+TASK_STATUS_CANCELLED = "cancelled"
+TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELLED}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 
 
@@ -71,6 +72,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
+    if task.get("prompt"):
+        item["prompt"] = task.get("prompt")
     if task.get("data") is not None:
         item["data"] = task.get("data")
     if task.get("error"):
@@ -167,6 +170,53 @@ class ImageTaskService:
                 missing_ids = []
             return {"items": items, "missing_ids": missing_ids}
 
+    def cancel_task(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        owner = _owner_id(identity)
+        key = _task_key(owner, task_id)
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("task not found")
+            if task.get("status") not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}:
+                raise ValueError(f"cannot cancel task in {task.get('status')} status")
+            task["status"] = TASK_STATUS_CANCELLED
+            task["error"] = "任务已取消"
+            task["updated_at"] = _now_iso()
+            self._save_locked()
+            return _public_task(task)
+
+    def retry_task(self, identity: dict[str, object], task_id: str, base_url: str) -> dict[str, Any]:
+        owner = _owner_id(identity)
+        key = _task_key(owner, task_id)
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("task not found")
+            if task.get("status") != TASK_STATUS_ERROR and task.get("status") != TASK_STATUS_CANCELLED:
+                raise ValueError(f"cannot retry task in {task.get('status')} status")
+            task["status"] = TASK_STATUS_QUEUED
+            task["error"] = ""
+            task["data"] = None
+            task["updated_at"] = _now_iso()
+            self._save_locked()
+            mode = task.get("mode", "generate")
+            payload = {
+                "prompt": task.get("prompt", ""),
+                "model": task.get("model", "gpt-image-2"),
+                "n": 1,
+                "size": task.get("size"),
+                "response_format": "url",
+                "base_url": base_url,
+            }
+            thread = threading.Thread(
+                target=self._run_task,
+                args=(key, mode, payload, dict(identity), task.get("model", "gpt-image-2")),
+                name=f"image-task-retry-{task_id[:16]}",
+                daemon=True,
+            )
+            thread.start()
+            return _public_task(task)
+
     def _submit(
         self,
         identity: dict[str, object],
@@ -198,6 +248,7 @@ class ImageTaskService:
                 "size": _clean(payload.get("size")),
                 "created_at": now,
                 "updated_at": now,
+                "prompt": _clean(payload.get("prompt")),
             }
             self._tasks[key] = task
             self._save_locked()
@@ -325,7 +376,7 @@ class ImageTaskService:
             if not task_id or not owner:
                 continue
             status = _clean(item.get("status"))
-            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}:
+            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELLED}:
                 status = TASK_STATUS_ERROR
             task = {
                 "id": task_id,
@@ -334,6 +385,7 @@ class ImageTaskService:
                 "mode": "edit" if item.get("mode") == "edit" else "generate",
                 "model": _clean(item.get("model"), "gpt-image-2"),
                 "size": _clean(item.get("size")),
+                "prompt": _clean(item.get("prompt")),
                 "created_at": _clean(item.get("created_at"), _now_iso()),
                 "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
             }
