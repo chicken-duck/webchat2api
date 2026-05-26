@@ -18,8 +18,20 @@ class ImageGenerationTaskRequest(BaseModel):
     size: str | None = None
 
 
+class CancelTaskRequest(BaseModel):
+    client_task_id: str = Field(..., min_length=1)
+
+
 def _parse_task_ids(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _extract_image_urls(sources: list) -> list[str]:
+    urls: list[str] = []
+    for src in sources:
+        if isinstance(src, str) and src.strip():
+            urls.append(src.strip())
+    return urls
 
 
 async def filter_or_log(call: LoggedCall, text: str) -> None:
@@ -76,6 +88,7 @@ def create_router() -> APIRouter:
         model = str(payload["model"])
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/edits", model, "图生图任务", request_text=prompt), prompt)
         images = await read_image_sources(image_sources)
+        image_urls = _extract_image_urls(image_sources)
         try:
             return await run_in_threadpool(
                 image_task_service.submit_edit,
@@ -85,6 +98,72 @@ def create_router() -> APIRouter:
                 model=model,
                 size=payload["size"],
                 base_url=resolve_image_base_url(request),
+                images=images,
+                image_urls=image_urls,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-tasks/cancel")
+    async def cancel_task(
+        body: CancelTaskRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            return await run_in_threadpool(
+                image_task_service.cancel_task,
+                identity,
+                client_task_id=body.client_task_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-tasks/retry")
+    async def retry_task(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+
+        if content_type == "application/json":
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail={"error": "JSON body must be an object"})
+            client_task_id = str(body.get("client_task_id") or "").strip()
+            if not client_task_id:
+                raise HTTPException(status_code=400, detail={"error": "client_task_id is required"})
+            base_url = resolve_image_base_url(request)
+            try:
+                return await run_in_threadpool(
+                    image_task_service.retry_task,
+                    identity,
+                    client_task_id=client_task_id,
+                    base_url=base_url,
+                    images=None,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+        form = await request.form()
+        client_task_id = str(form.get("client_task_id") or "").strip()
+        if not client_task_id:
+            raise HTTPException(status_code=400, detail={"error": "client_task_id is required"})
+        prompt = str(form.get("prompt") or "").strip()
+        model = str(form.get("model") or "gpt-image-2")
+        if prompt:
+            await filter_or_log(LoggedCall(identity, "/api/image-tasks/retry", model, "图生图任务重试", request_text=prompt), prompt)
+
+        _, image_sources = await parse_image_edit_request(request)
+        images = await read_image_sources(image_sources)
+        base_url = resolve_image_base_url(request)
+        try:
+            return await run_in_threadpool(
+                image_task_service.retry_task,
+                identity,
+                client_task_id=client_task_id,
+                base_url=base_url,
                 images=images,
             )
         except ValueError as exc:

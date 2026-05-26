@@ -208,10 +208,12 @@ export type ImageResponse = {
 
 export type ImageTask = {
   id: string;
-  status: "queued" | "running" | "success" | "error";
+  status: "queued" | "running" | "success" | "error" | "cancelled";
   mode: "generate" | "edit";
   model?: ImageModel;
   size?: string;
+  prompt?: string;
+  image_urls?: string[];
   created_at: string;
   updated_at: string;
   data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
@@ -469,6 +471,33 @@ export async function fetchImageTasks(ids: string[]) {
     params.set("ids", ids.join(","));
   }
   return httpRequest<ImageTaskListResponse>(`/api/image-tasks${params.toString() ? `?${params.toString()}` : ""}`);
+}
+
+export async function cancelImageTask(clientTaskId: string) {
+  return httpRequest<ImageTask>("/api/image-tasks/cancel", {
+    method: "POST",
+    body: { client_task_id: clientTaskId },
+  });
+}
+
+export async function retryImageGenerationTask(clientTaskId: string) {
+  return httpRequest<ImageTask>("/api/image-tasks/retry", {
+    method: "POST",
+    body: { client_task_id: clientTaskId },
+  });
+}
+
+export async function retryImageEditTask(clientTaskId: string, files: File | File[]) {
+  const formData = new FormData();
+  const uploadFiles = Array.isArray(files) ? files : [files];
+  uploadFiles.forEach((file) => {
+    formData.append("image", file);
+  });
+  formData.append("client_task_id", clientTaskId);
+  return httpRequest<ImageTask>("/api/image-tasks/retry", {
+    method: "POST",
+    body: formData,
+  });
 }
 
 export async function fetchSettingsConfig() {

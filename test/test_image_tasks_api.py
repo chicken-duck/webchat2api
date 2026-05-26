@@ -29,6 +29,8 @@ class FakeImageTaskService:
     def __init__(self):
         self.generation_calls = []
         self.edit_calls = []
+        self.cancel_calls = []
+        self.retry_calls = []
 
     def submit_generation(self, identity, **kwargs):
         self.generation_calls.append((identity, kwargs))
@@ -66,6 +68,27 @@ class FakeImageTaskService:
                 if task_id != "missing"
             ],
             "missing_ids": [task_id for task_id in ids if task_id == "missing"],
+        }
+
+    def cancel_task(self, identity, **kwargs):
+        self.cancel_calls.append((identity, kwargs))
+        return {
+            "id": kwargs["client_task_id"],
+            "status": "cancelled",
+            "mode": "generate",
+            "error": "任务已被取消",
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:01",
+        }
+
+    def retry_task(self, identity, **kwargs):
+        self.retry_calls.append((identity, kwargs))
+        return {
+            "id": kwargs["client_task_id"],
+            "status": "queued",
+            "mode": "generate",
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:02",
         }
 
 
@@ -135,6 +158,50 @@ class ImageTasksApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual([item["id"] for item in payload["items"]], ["task-1"])
         self.assertEqual(payload["missing_ids"], ["missing"])
+
+    def test_cancel_task_endpoint(self):
+        response = self.client.post(
+            "/api/image-tasks/cancel",
+            headers=AUTH_HEADERS,
+            json={"client_task_id": "cancel-1"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["id"], "cancel-1")
+        self.assertEqual(payload["status"], "cancelled")
+        self.assertIn("已取消", payload.get("error", ""))
+        self.assertEqual(len(self.fake_service.cancel_calls), 1)
+
+    def test_retry_generation_task_endpoint(self):
+        response = self.client.post(
+            "/api/image-tasks/retry",
+            headers=AUTH_HEADERS,
+            json={"client_task_id": "retry-gen-1"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["id"], "retry-gen-1")
+        self.assertEqual(payload["status"], "queued")
+        self.assertEqual(len(self.fake_service.retry_calls), 1)
+
+    def test_retry_edit_task_endpoint(self):
+        response = self.client.post(
+            "/api/image-tasks/retry",
+            headers=AUTH_HEADERS,
+            data={"client_task_id": "retry-edit-1"},
+            files=[
+                ("image", ("img.png", b"imgdata", "image/png")),
+            ],
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["id"], "retry-edit-1")
+        self.assertEqual(len(self.fake_service.retry_calls), 1)
+        call_kwargs = self.fake_service.retry_calls[0][1]
+        self.assertIsNotNone(call_kwargs.get("images"))
 
 
 if __name__ == "__main__":

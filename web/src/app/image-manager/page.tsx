@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CalendarDays, ChevronLeft, ChevronRight, Copy, Download, ImageIcon, LoaderCircle, Maximize2, Plus, RefreshCw, Search, Tag, Trash2, X } from "lucide-react";
+import { CalendarDays, ChevronLeft, ChevronRight, Copy, Download, ImageIcon, LoaderCircle, Maximize2, Plus, RefreshCw, RotateCcw, Search, StopCircle, Tag, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { DateRangeFilter } from "@/components/date-range-filter";
@@ -13,7 +13,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageTags, fetchManagedImages, setImageTags, type ManagedImage } from "@/lib/api";
+import { cancelImageTask, retryImageGenerationTask, deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageTags, fetchImageTasks, fetchManagedImages, retryImageEditTask, setImageTags, type ImageTask, type ManagedImage } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LONG_PRESS_MS = 800;
@@ -85,6 +85,77 @@ function ImageManagerContent() {
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [deleteMode, setDeleteMode] = useState<"selected" | "filtered" | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
+
+  const [tasks, setTasks] = useState<ImageTask[]>([]);
+  const [tasksLoading, setTasksLoading] = useState(false);
+  const [cancellingTaskId, setCancellingTaskId] = useState<string | null>(null);
+  const [retryingTaskId, setRetryingTaskId] = useState<string | null>(null);
+  const [tasksError, setTasksError] = useState<string | null>(null);
+
+  const hasUnfinishedTasks = tasks.some((t) => t.status === "queued" || t.status === "running");
+
+  const loadTasks = useCallback(async () => {
+    setTasksError(null);
+    try {
+      const data = await fetchImageTasks([]);
+      setTasks(data.items);
+    } catch (error) {
+      setTasksError(error instanceof Error ? error.message : "加载任务列表失败");
+    } finally {
+      setTasksLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    setTasksLoading(true);
+    void loadTasks();
+  }, [loadTasks]);
+
+  useEffect(() => {
+    if (!hasUnfinishedTasks) return;
+    const interval = setInterval(() => {
+      void loadTasks();
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [hasUnfinishedTasks, loadTasks]);
+
+  const handleCancelTask = async (taskId: string) => {
+    setCancellingTaskId(taskId);
+    try {
+      await cancelImageTask(taskId);
+      toast.success("任务已取消");
+      await loadTasks();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "取消失败");
+    } finally {
+      setCancellingTaskId(null);
+    }
+  };
+
+  const handleRetryGenerationTask = async (taskId: string) => {
+    setRetryingTaskId(taskId);
+    try {
+      await retryImageGenerationTask(taskId);
+      toast.success("任务已重新提交");
+      await loadTasks();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "重试失败");
+    } finally {
+      setRetryingTaskId(null);
+    }
+  };
+
+  const taskStatusBadge = (status: string) => {
+    const map: Record<string, { className: string; label: string }> = {
+      queued: { className: "border-blue-200 bg-blue-50 text-blue-700", label: "排队中" },
+      running: { className: "border-amber-200 bg-amber-50 text-amber-700", label: "运行中" },
+      success: { className: "border-green-200 bg-green-50 text-green-700", label: "成功" },
+      error: { className: "border-red-200 bg-red-50 text-red-700", label: "失败" },
+      cancelled: { className: "border-stone-200 bg-stone-50 text-stone-500", label: "已取消" },
+    };
+    const info = map[status] || { className: "border-stone-200 bg-stone-50 text-stone-600", label: status };
+    return { ...info };
+  };
 
   const filteredItems = selectedTags.length > 0
     ? items.filter((item) => selectedTags.every((t) => (item.tags ?? []).includes(t)))
@@ -627,6 +698,120 @@ function ImageManagerContent() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <section className="mt-6 rounded-[28px] border border-white/70 bg-white/50 p-5 shadow-[var(--shadow-soft)] backdrop-blur-sm lg:p-6">
+        <div className="mb-4 flex flex-col gap-2 lg:flex-row lg:items-end lg:justify-between">
+          <div className="space-y-1">
+            <div className="text-xs font-semibold tracking-[0.18em] text-stone-500 uppercase">Async Tasks</div>
+            <h2 className="text-2xl font-semibold tracking-tight">图片任务管理</h2>
+          </div>
+          <Button variant="outline" onClick={() => void loadTasks()} disabled={tasksLoading} className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700">
+            <RefreshCw className={`mr-1 size-4 ${tasksLoading ? "animate-spin" : ""}`} />
+            刷新任务
+          </Button>
+        </div>
+
+        {tasksError ? (
+          <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">{tasksError}</div>
+        ) : null}
+
+        {!tasksLoading && tasks.length === 0 && !tasksError ? (
+          <div className="rounded-xl border border-stone-200 bg-stone-50 px-6 py-14 text-center text-sm text-stone-500">
+            暂无图片任务
+          </div>
+        ) : null}
+
+        {tasks.length > 0 ? (
+          <div className="overflow-x-auto rounded-2xl border border-stone-200 bg-white">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-stone-200 bg-stone-50 text-left text-xs font-medium text-stone-500 uppercase tracking-wider">
+                  <th className="px-4 py-3">任务 ID</th>
+                  <th className="px-4 py-3">状态</th>
+                  <th className="px-4 py-3">模式</th>
+                  <th className="px-4 py-3">模型</th>
+                  <th className="px-4 py-3">尺寸</th>
+                  <th className="px-4 py-3">提示词</th>
+                  <th className="px-4 py-3">创建时间</th>
+                  <th className="px-4 py-3">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tasks.map((task) => {
+                  const badge = taskStatusBadge(task.status);
+                  const isCancelling = cancellingTaskId === task.id;
+                  const isRetrying = retryingTaskId === task.id;
+                  return (
+                    <tr key={task.id} className="border-b border-stone-100 last:border-b-0 hover:bg-stone-50/50">
+                      <td className="max-w-[120px] truncate px-4 py-3 font-mono text-xs text-stone-600" title={task.id}>
+                        {task.id}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs font-medium ${badge.className}`}>
+                          {task.status === "running" ? <LoaderCircle className="inline size-3 animate-spin" /> : null}
+                          {badge.label}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-xs text-stone-600">
+                        {task.mode === "edit" ? "图生图" : "文生图"}
+                      </td>
+                      <td className="max-w-[100px] truncate px-4 py-3 font-mono text-xs text-stone-600" title={task.model}>
+                        {task.model || "-"}
+                      </td>
+                      <td className="px-4 py-3 text-xs text-stone-500">
+                        {task.size || "-"}
+                      </td>
+                      <td className="max-w-[180px] truncate px-4 py-3 text-xs text-stone-600" title={task.prompt || task.error || ""}>
+                        {task.prompt || task.error || "-"}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-xs text-stone-500">
+                        {task.created_at || "-"}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3">
+                        <div className="flex items-center gap-1">
+                          {(task.status === "queued" || task.status === "running") ? (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8 rounded-lg border-red-200 text-red-600 hover:bg-red-50"
+                              disabled={isCancelling}
+                              onClick={() => void handleCancelTask(task.id)}
+                            >
+                              {isCancelling ? (
+                                <LoaderCircle className="size-3.5 animate-spin" />
+                              ) : (
+                                <StopCircle className="size-3.5" />
+                              )}
+                              取消
+                            </Button>
+                          ) : null}
+                          {task.status === "error" ? (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8 rounded-lg border-amber-200 text-amber-600 hover:bg-amber-50"
+                              disabled={isRetrying}
+                              onClick={() => void handleRetryGenerationTask(task.id)}
+                            >
+                              {isRetrying ? (
+                                <LoaderCircle className="size-3.5 animate-spin" />
+                              ) : (
+                                <RotateCcw className="size-3.5" />
+                              )}
+                              重试
+                            </Button>
+                          ) : null}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+      </section>
+
     </section>
   );
 }

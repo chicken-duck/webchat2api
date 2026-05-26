@@ -17,7 +17,8 @@ TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
-TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
+TASK_STATUS_CANCELLED = "cancelled"
+TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELLED}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 
 
@@ -71,6 +72,10 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
+    if task.get("prompt"):
+        item["prompt"] = task.get("prompt")
+    if task.get("image_urls"):
+        item["image_urls"] = task.get("image_urls")
     if task.get("data") is not None:
         item["data"] = task.get("data")
     if task.get("error"):
@@ -131,6 +136,7 @@ class ImageTaskService:
         size: str | None,
         base_url: str,
         images: list[tuple[bytes, str, str]],
+        image_urls: list[str] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -141,6 +147,8 @@ class ImageTaskService:
             "response_format": "url",
             "base_url": base_url,
         }
+        if image_urls:
+            payload["image_urls"] = image_urls
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
@@ -166,6 +174,88 @@ class ImageTaskService:
                 items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
                 missing_ids = []
             return {"items": items, "missing_ids": missing_ids}
+
+    def cancel_task(self, identity: dict[str, object], *, client_task_id: str) -> dict[str, Any]:
+        task_id = _clean(client_task_id)
+        if not task_id:
+            raise ValueError("client_task_id is required")
+        owner = _owner_id(identity)
+        key = _task_key(owner, task_id)
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("task not found")
+            status = task.get("status")
+            if status not in UNFINISHED_STATUSES:
+                raise ValueError("only queued or running tasks can be cancelled")
+            task["status"] = TASK_STATUS_CANCELLED
+            task["error"] = "任务已被取消"
+            task["updated_at"] = _now_iso()
+            self._save_locked()
+        return _public_task(task)
+
+    def retry_task(
+        self,
+        identity: dict[str, object],
+        *,
+        client_task_id: str,
+        base_url: str,
+        images: list[tuple[bytes, str, str]] | None = None,
+    ) -> dict[str, Any]:
+        task_id = _clean(client_task_id)
+        if not task_id:
+            raise ValueError("client_task_id is required")
+        owner = _owner_id(identity)
+        key = _task_key(owner, task_id)
+        with self._lock:
+            cleaned = self._cleanup_locked()
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("task not found")
+            status = task.get("status")
+            if status != TASK_STATUS_ERROR:
+                raise ValueError("only error tasks can be retried")
+            mode = task.get("mode")
+            model = task.get("model", "gpt-image-2")
+            prompt = task.get("prompt", "")
+            if mode == "edit":
+                if not images:
+                    raise ValueError("images are required for image edit task retry")
+                payload = {
+                    "prompt": prompt,
+                    "images": images,
+                    "model": model,
+                    "n": 1,
+                    "size": task.get("size"),
+                    "response_format": "url",
+                    "base_url": base_url,
+                }
+            else:
+                payload = {
+                    "prompt": prompt,
+                    "model": model,
+                    "n": 1,
+                    "size": task.get("size"),
+                    "response_format": "url",
+                    "base_url": base_url,
+                }
+            task["status"] = TASK_STATUS_QUEUED
+            task["error"] = ""
+            task["data"] = None
+            task["updated_at"] = _now_iso()
+            if cleaned:
+                self._save_locked()
+            else:
+                self._save_locked()
+
+        thread = threading.Thread(
+            target=self._run_task,
+            args=(key, mode, payload, dict(identity), model),
+            name=f"image-task-{task_id[:16]}-retry",
+            daemon=True,
+        )
+        thread.start()
+        return _public_task(task)
 
     def _submit(
         self,
@@ -199,6 +289,12 @@ class ImageTaskService:
                 "created_at": now,
                 "updated_at": now,
             }
+            prompt_text = _clean(payload.get("prompt"))
+            if prompt_text:
+                task["prompt"] = prompt_text
+            image_urls = payload.get("image_urls")
+            if isinstance(image_urls, list):
+                task["image_urls"] = [u for u in image_urls if isinstance(u, str) and u.strip()]
             self._tasks[key] = task
             self._save_locked()
             should_start = True
@@ -325,7 +421,8 @@ class ImageTaskService:
             if not task_id or not owner:
                 continue
             status = _clean(item.get("status"))
-            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}:
+            valid_statuses = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELLED}
+            if status not in valid_statuses:
                 status = TASK_STATUS_ERROR
             task = {
                 "id": task_id,
@@ -337,6 +434,12 @@ class ImageTaskService:
                 "created_at": _clean(item.get("created_at"), _now_iso()),
                 "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
             }
+            prompt = _clean(item.get("prompt"))
+            if prompt:
+                task["prompt"] = prompt
+            image_urls = item.get("image_urls")
+            if isinstance(image_urls, list):
+                task["image_urls"] = [u for u in image_urls if isinstance(u, str) and u.strip()]
             data = item.get("data")
             if isinstance(data, list):
                 task["data"] = data
