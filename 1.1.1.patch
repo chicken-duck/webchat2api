@@ -1,0 +1,1270 @@
+diff --git a/api/image_tasks.py b/api/image_tasks.py
+index 76c3f97..1ed7f23 100644
+--- a/api/image_tasks.py
++++ b/api/image_tasks.py
+@@ -5,7 +5,7 @@ from fastapi.concurrency import run_in_threadpool
+ from pydantic import BaseModel, Field
+ 
+ from api.image_inputs import parse_image_edit_request, read_image_sources
+-from api.support import require_identity, resolve_image_base_url
++from api.support import require_admin, require_identity, resolve_image_base_url
+ from services.content_filter import check_request
+ from services.image_task_service import image_task_service
+ from services.log_service import LoggedCall
+@@ -18,6 +18,10 @@ class ImageGenerationTaskRequest(BaseModel):
+     size: str | None = None
+ 
+ 
++class ImageTaskActionRequest(BaseModel):
++    key: str = Field(..., min_length=1)
++
++
+ def _parse_task_ids(value: str) -> list[str]:
+     return [item.strip() for item in value.split(",") if item.strip()]
+ 
+@@ -90,4 +94,36 @@ def create_router() -> APIRouter:
+         except ValueError as exc:
+             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+ 
++    @router.post("/api/image-tasks/cancel")
++    async def cancel_image_task(
++        body: ImageTaskActionRequest,
++        authorization: str | None = Header(default=None),
++    ):
++        identity = require_admin(authorization)
++        try:
++            return await run_in_threadpool(image_task_service.cancel_task, identity, body.key)
++        except KeyError as exc:
++            raise HTTPException(status_code=404, detail={"error": str(exc.args[0])}) from exc
++        except ValueError as exc:
++            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
++
++    @router.post("/api/image-tasks/retry")
++    async def retry_image_task(
++        body: ImageTaskActionRequest,
++        request: Request,
++        authorization: str | None = Header(default=None),
++    ):
++        identity = require_admin(authorization)
++        try:
++            return await run_in_threadpool(
++                image_task_service.retry_task,
++                identity,
++                body.key,
++                base_url=resolve_image_base_url(request),
++            )
++        except KeyError as exc:
++            raise HTTPException(status_code=404, detail={"error": str(exc.args[0])}) from exc
++        except ValueError as exc:
++            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
++
+     return router
+diff --git a/services/image_task_service.py b/services/image_task_service.py
+index 352a3a4..644ec70 100644
+--- a/services/image_task_service.py
++++ b/services/image_task_service.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import base64
+ import json
+ import threading
+ import time
+@@ -17,7 +18,8 @@ TASK_STATUS_QUEUED = "queued"
+ TASK_STATUS_RUNNING = "running"
+ TASK_STATUS_SUCCESS = "success"
+ TASK_STATUS_ERROR = "error"
+-TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
++TASK_STATUS_CANCELLED = "cancelled"
++TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELLED}
+ UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+ 
+ 
+@@ -47,6 +49,14 @@ def _owner_id(identity: dict[str, object]) -> str:
+     return _clean(identity.get("id")) or "anonymous"
+ 
+ 
++def _owner_name(identity: dict[str, object]) -> str:
++    return _clean(identity.get("name")) or _owner_id(identity)
++
++
++def _owner_role(identity: dict[str, object]) -> str:
++    return _clean(identity.get("role"), "user") or "user"
++
++
+ def _task_key(owner_id: str, task_id: str) -> str:
+     return f"{owner_id}:{task_id}"
+ 
+@@ -61,13 +71,125 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
+     return urls
+ 
+ 
++def _serialize_images(images: object) -> list[dict[str, str]]:
++    if not isinstance(images, list):
++        return []
++    items: list[dict[str, str]] = []
++    for image in images:
++        if not isinstance(image, tuple) or len(image) != 3:
++            continue
++        content, filename, content_type = image
++        if not isinstance(content, bytes):
++            continue
++        items.append(
++            {
++                "bytes_b64": base64.b64encode(content).decode("ascii"),
++                "filename": _clean(filename, "image.png"),
++                "content_type": _clean(content_type, "application/octet-stream"),
++            }
++        )
++    return items
++
++
++def _normalize_serialized_images(images: object) -> list[dict[str, str]]:
++    if not isinstance(images, list):
++        return []
++    normalized: list[dict[str, str]] = []
++    for item in images:
++        if not isinstance(item, dict):
++            continue
++        bytes_b64 = _clean(item.get("bytes_b64"))
++        filename = _clean(item.get("filename"), "image.png")
++        content_type = _clean(item.get("content_type"), "application/octet-stream")
++        if not bytes_b64:
++            continue
++        normalized.append({"bytes_b64": bytes_b64, "filename": filename, "content_type": content_type})
++    return normalized
++
++
++def _deserialize_images(images: object) -> list[tuple[bytes, str, str]]:
++    result: list[tuple[bytes, str, str]] = []
++    for item in _normalize_serialized_images(images):
++        try:
++            content = base64.b64decode(item["bytes_b64"], validate=True)
++        except Exception:
++            continue
++        result.append((content, item["filename"], item["content_type"]))
++    return result
++
++
++def _serialize_request(payload: dict[str, Any]) -> dict[str, Any]:
++    request = {
++        "prompt": _clean(payload.get("prompt")),
++        "model": _clean(payload.get("model"), "gpt-image-2"),
++        "n": 1,
++        "size": _clean(payload.get("size")),
++        "response_format": "url",
++        "base_url": _clean(payload.get("base_url")),
++    }
++    serialized_images = _serialize_images(payload.get("images"))
++    if serialized_images:
++        request["images"] = serialized_images
++    return request
++
++
++def _normalize_request(value: object, mode: str, *, prompt: str, model: str, size: str) -> dict[str, Any]:
++    request = value if isinstance(value, dict) else {}
++    normalized = {
++        "prompt": _clean(request.get("prompt"), prompt),
++        "model": _clean(request.get("model"), model),
++        "n": 1,
++        "size": _clean(request.get("size"), size),
++        "response_format": "url",
++        "base_url": _clean(request.get("base_url")),
++    }
++    if mode == "edit":
++        images = _normalize_serialized_images(request.get("images"))
++        if images:
++            normalized["images"] = images
++    return normalized
++
++
++def _task_request_payload(task: dict[str, Any], *, base_url: str = "") -> dict[str, Any]:
++    request = task.get("request") if isinstance(task.get("request"), dict) else {}
++    payload = {
++        "prompt": _clean(request.get("prompt"), _clean(task.get("prompt"))),
++        "model": _clean(request.get("model"), _clean(task.get("model"), "gpt-image-2")),
++        "n": 1,
++        "size": _clean(request.get("size"), _clean(task.get("size"))),
++        "response_format": "url",
++        "base_url": _clean(base_url or request.get("base_url")),
++    }
++    if task.get("mode") == "edit":
++        payload["images"] = _deserialize_images(request.get("images"))
++    return payload
++
++
++def _task_identity(task: dict[str, Any]) -> dict[str, object]:
++    return {
++        "id": _clean(task.get("owner_id")) or "anonymous",
++        "name": _clean(task.get("owner_name")) or _clean(task.get("owner_id")) or "anonymous",
++        "role": _clean(task.get("owner_role"), "user") or "user",
++    }
++
++
++def _can_access(identity: dict[str, object], task: dict[str, Any]) -> bool:
++    return _owner_role(identity) == "admin" or _owner_id(identity) == _clean(task.get("owner_id"))
++
++
+ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
+     item = {
++        "key": task.get("key") or _task_key(_clean(task.get("owner_id")), _clean(task.get("id"))),
+         "id": task.get("id"),
++        "owner_id": task.get("owner_id"),
++        "owner_name": task.get("owner_name"),
++        "owner_role": task.get("owner_role"),
+         "status": task.get("status"),
+         "mode": task.get("mode"),
+         "model": task.get("model"),
+         "size": task.get("size"),
++        "prompt": task.get("prompt"),
++        "input_count": int(task.get("input_count") or 0),
+         "created_at": task.get("created_at"),
+         "updated_at": task.get("updated_at"),
+     }
+@@ -145,27 +267,86 @@ class ImageTaskService:
+ 
+     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
+         owner = _owner_id(identity)
++        is_admin = _owner_role(identity) == "admin"
+         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
+         with self._lock:
+             if self._cleanup_locked():
+                 self._save_locked()
+             items = []
+             missing_ids = []
+-            for task_id in requested_ids:
+-                task = self._tasks.get(_task_key(owner, task_id))
+-                if task is None:
+-                    missing_ids.append(task_id)
+-                else:
++            if requested_ids:
++                for task_id in requested_ids:
++                    task = self._tasks.get(task_id)
++                    if task is None and not is_admin:
++                        task = self._tasks.get(_task_key(owner, task_id))
++                    if task is None:
++                        if is_admin:
++                            matches = [item for item in self._tasks.values() if _clean(item.get("id")) == task_id]
++                            items.extend(_public_task(item) for item in matches if _can_access(identity, item))
++                            if matches:
++                                continue
++                        missing_ids.append(task_id)
++                        continue
++                    if not _can_access(identity, task):
++                        missing_ids.append(task_id)
++                        continue
+                     items.append(_public_task(task))
+-            if not requested_ids:
+-                items = [
+-                    _public_task(task)
+-                    for task in self._tasks.values()
+-                    if task.get("owner_id") == owner
+-                ]
+-                items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+-                missing_ids = []
+-            return {"items": items, "missing_ids": missing_ids}
++                return {"items": items, "missing_ids": missing_ids}
++
++            items = [
++                _public_task(task)
++                for task in self._tasks.values()
++                if is_admin or _clean(task.get("owner_id")) == owner
++            ]
++            items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
++            return {"items": items, "missing_ids": []}
++
++    def cancel_task(self, identity: dict[str, object], task_key: str) -> dict[str, Any]:
++        key = _clean(task_key)
++        with self._lock:
++            task = self._tasks.get(key)
++            if task is None or not _can_access(identity, task):
++                raise KeyError("task not found")
++            status = _clean(task.get("status"))
++            if status == TASK_STATUS_CANCELLED:
++                return _public_task(task)
++            if status not in UNFINISHED_STATUSES:
++                raise ValueError("only queued or running task can be cancelled")
++            task["status"] = TASK_STATUS_CANCELLED
++            task["error"] = "任务已取消"
++            task.pop("data", None)
++            task["updated_at"] = _now_iso()
++            self._save_locked()
++            return _public_task(task)
++
++    def retry_task(self, identity: dict[str, object], task_key: str, *, base_url: str) -> dict[str, Any]:
++        key = _clean(task_key)
++        with self._lock:
++            task = self._tasks.get(key)
++            if task is None or not _can_access(identity, task):
++                raise KeyError("task not found")
++            if _clean(task.get("status")) != TASK_STATUS_ERROR:
++                raise ValueError("only error task can be retried")
++            payload = _task_request_payload(task, base_url=base_url)
++            if not _clean(payload.get("prompt")):
++                raise ValueError("missing task prompt")
++            if task.get("mode") == "edit" and not payload.get("images"):
++                raise ValueError("missing original task images")
++            request = task.get("request") if isinstance(task.get("request"), dict) else {}
++            request["base_url"] = _clean(base_url or request.get("base_url"))
++            task["request"] = request
++            task["status"] = TASK_STATUS_QUEUED
++            task.pop("error", None)
++            task.pop("data", None)
++            task["updated_at"] = _now_iso()
++            self._save_locked()
++            public_task = _public_task(task)
++            mode = _clean(task.get("mode"), "generate")
++            model = _clean(task.get("model"), "gpt-image-2")
++            task_identity = _task_identity(task)
++
++        self._start_task_thread(key, mode, payload, task_identity, model)
++        return public_task
+ 
+     def _submit(
+         self,
+@@ -181,7 +362,6 @@ class ImageTaskService:
+         owner = _owner_id(identity)
+         key = _task_key(owner, task_id)
+         now = _now_iso()
+-        should_start = False
+         with self._lock:
+             cleaned = self._cleanup_locked()
+             task = self._tasks.get(key)
+@@ -190,29 +370,43 @@ class ImageTaskService:
+                     self._save_locked()
+                 return _public_task(task)
+             task = {
++                "key": key,
+                 "id": task_id,
+                 "owner_id": owner,
++                "owner_name": _owner_name(identity),
++                "owner_role": _owner_role(identity),
+                 "status": TASK_STATUS_QUEUED,
+                 "mode": mode,
+                 "model": _clean(payload.get("model"), "gpt-image-2"),
+                 "size": _clean(payload.get("size")),
++                "prompt": _clean(payload.get("prompt")),
++                "input_count": len(payload.get("images") or []),
++                "request": _serialize_request(payload),
+                 "created_at": now,
+                 "updated_at": now,
+             }
+             self._tasks[key] = task
+             self._save_locked()
+-            should_start = True
+-
+-        if should_start:
+-            thread = threading.Thread(
+-                target=self._run_task,
+-                args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
+-                name=f"image-task-{task_id[:16]}",
+-                daemon=True,
+-            )
+-            thread.start()
++
++        self._start_task_thread(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2"))
+         return _public_task(task)
+ 
++    def _start_task_thread(
++        self,
++        key: str,
++        mode: str,
++        payload: dict[str, Any],
++        identity: dict[str, object],
++        model: str,
++    ) -> None:
++        thread = threading.Thread(
++            target=self._run_task,
++            args=(key, mode, payload, identity, model),
++            name=f"image-task-{_clean(key).split(':', 1)[-1][:16]}",
++            daemon=True,
++        )
++        thread.start()
++
+     def _run_task(
+         self,
+         key: str,
+@@ -222,7 +416,8 @@ class ImageTaskService:
+         model: str,
+     ) -> None:
+         started = time.time()
+-        self._update_task(key, status=TASK_STATUS_RUNNING, error="")
++        if not self._mark_task_running(key):
++            return
+         try:
+             handler = self.edit_handler if mode == "edit" else self.generation_handler
+             result = handler(payload)
+@@ -236,7 +431,8 @@ class ImageTaskService:
+                 else:
+                     message = "号池中没有可用账号或所有账号均被限流，请检查号池状态（账号额度、是否被封禁、是否到达生图上限）"
+                 raise RuntimeError(message)
+-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="")
++            if not self._finish_task(key, status=TASK_STATUS_SUCCESS, data=data, error=""):
++                return
+             self._log_call(
+                 identity,
+                 mode,
+@@ -248,7 +444,8 @@ class ImageTaskService:
+             )
+         except Exception as exc:
+             error_message = str(exc) or "image task failed"
+-            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[])
++            if not self._finish_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[]):
++                return
+             self._log_call(
+                 identity,
+                 mode,
+@@ -297,14 +494,26 @@ class ImageTaskService:
+         except Exception:
+             pass
+ 
+-    def _update_task(self, key: str, **updates: Any) -> None:
++    def _mark_task_running(self, key: str) -> bool:
+         with self._lock:
+             task = self._tasks.get(key)
+-            if task is None:
+-                return
++            if task is None or _clean(task.get("status")) != TASK_STATUS_QUEUED:
++                return False
++            task["status"] = TASK_STATUS_RUNNING
++            task["error"] = ""
++            task["updated_at"] = _now_iso()
++            self._save_locked()
++            return True
++
++    def _finish_task(self, key: str, **updates: Any) -> bool:
++        with self._lock:
++            task = self._tasks.get(key)
++            if task is None or _clean(task.get("status")) != TASK_STATUS_RUNNING:
++                return False
+             task.update(updates)
+             task["updated_at"] = _now_iso()
+             self._save_locked()
++            return True
+ 
+     def _load_locked(self) -> dict[str, dict[str, Any]]:
+         if not self.path.exists():
+@@ -325,25 +534,37 @@ class ImageTaskService:
+             if not task_id or not owner:
+                 continue
+             status = _clean(item.get("status"))
+-            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}:
++            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELLED}:
+                 status = TASK_STATUS_ERROR
++            mode = "edit" if item.get("mode") == "edit" else "generate"
++            model = _clean(item.get("model"), "gpt-image-2")
++            size = _clean(item.get("size"))
++            prompt = _clean(item.get("prompt"))
+             task = {
++                "key": _clean(item.get("key")) or _task_key(owner, task_id),
+                 "id": task_id,
+                 "owner_id": owner,
++                "owner_name": _clean(item.get("owner_name"), owner),
++                "owner_role": _clean(item.get("owner_role"), "user") or "user",
+                 "status": status,
+-                "mode": "edit" if item.get("mode") == "edit" else "generate",
+-                "model": _clean(item.get("model"), "gpt-image-2"),
+-                "size": _clean(item.get("size")),
++                "mode": mode,
++                "model": model,
++                "size": size,
++                "prompt": prompt,
++                "request": _normalize_request(item.get("request"), mode, prompt=prompt, model=model, size=size),
++                "input_count": int(item.get("input_count") or 0),
+                 "created_at": _clean(item.get("created_at"), _now_iso()),
+                 "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
+             }
++            if mode == "edit":
++                task["input_count"] = len(task["request"].get("images") or [])
+             data = item.get("data")
+             if isinstance(data, list):
+                 task["data"] = data
+             error = _clean(item.get("error"))
+             if error:
+                 task["error"] = error
+-            tasks[_task_key(owner, task_id)] = task
++            tasks[_clean(task["key"])] = task
+         return tasks
+ 
+     def _save_locked(self) -> None:
+@@ -355,9 +576,15 @@ class ImageTaskService:
+     def _recover_unfinished_locked(self) -> bool:
+         changed = False
+         for task in self._tasks.values():
+-            if task.get("status") in UNFINISHED_STATUSES:
++            status = _clean(task.get("status"))
++            if status == TASK_STATUS_RUNNING:
++                task["status"] = TASK_STATUS_ERROR
++                task["error"] = "服务已重启，运行中的图片任务已中断"
++                task["updated_at"] = _now_iso()
++                changed = True
++            elif status == TASK_STATUS_QUEUED:
+                 task["status"] = TASK_STATUS_ERROR
+-                task["error"] = "服务已重启，未完成的图片任务已中断"
++                task["error"] = "服务已重启，排队中的图片任务未继续执行"
+                 task["updated_at"] = _now_iso()
+                 changed = True
+         return changed
+diff --git a/test/test_image_task_service.py b/test/test_image_task_service.py
+index 566db0f..6647865 100644
+--- a/test/test_image_task_service.py
++++ b/test/test_image_task_service.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import json
+ import tempfile
++import threading
+ import time
+ import unittest
+ from pathlib import Path
+@@ -9,8 +10,9 @@ from pathlib import Path
+ from services.image_task_service import ImageTaskService
+ 
+ 
+-OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
++OWNER = {"id": "owner-1", "name": "Owner", "role": "user"}
+ OTHER_OWNER = {"id": "owner-2", "name": "Other", "role": "user"}
++ADMIN = {"id": "admin", "name": "管理员", "role": "admin"}
+ 
+ 
+ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_id: str, status: str, timeout: float = 2.0):
+@@ -86,26 +88,108 @@ class ImageTaskServiceTests(unittest.TestCase):
+             self.assertEqual(result["items"], [])
+             self.assertEqual(result["missing_ids"], ["private-task"])
+ 
+-    def test_success_task_persists_to_new_service_instance(self):
++    def test_admin_can_list_all_tasks(self):
+         with tempfile.TemporaryDirectory() as tmp_dir:
+-            path = Path(tmp_dir) / "image_tasks.json"
+-            service = self.make_service(path)
++            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
+             service.submit_generation(
+                 OWNER,
+-                client_task_id="persisted-task",
++                client_task_id="owner-task",
+                 prompt="cat",
+                 model="gpt-image-2",
+                 size=None,
+                 base_url="http://local.test",
+             )
+-            wait_for_task(service, OWNER, "persisted-task", "success")
++            service.submit_generation(
++                OTHER_OWNER,
++                client_task_id="other-task",
++                prompt="dog",
++                model="gpt-image-2",
++                size="1024x1024",
++                base_url="http://local.test",
++            )
+ 
+-            reloaded = self.make_service(path)
+-            result = reloaded.list_tasks(OWNER, ["persisted-task"])
++            wait_for_task(service, OWNER, "owner-task", "success")
++            wait_for_task(service, OTHER_OWNER, "other-task", "success")
++            result = service.list_tasks(ADMIN, [])
+ 
++            self.assertEqual({item["id"] for item in result["items"]}, {"owner-task", "other-task"})
++            self.assertEqual({item["owner_id"] for item in result["items"]}, {"owner-1", "owner-2"})
+             self.assertEqual(result["missing_ids"], [])
+-            self.assertEqual(result["items"][0]["status"], "success")
+-            self.assertEqual(result["items"][0]["data"][0]["url"], "http://example.test/image.png")
++
++    def test_cancel_running_task_persists_and_is_not_overwritten(self):
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            path = Path(tmp_dir) / "image_tasks.json"
++            started = threading.Event()
++            release = threading.Event()
++
++            def handler(_payload):
++                started.set()
++                self.assertTrue(release.wait(timeout=1.0))
++                return {"data": [{"url": "http://example.test/image.png"}]}
++
++            service = self.make_service(path, handler)
++            created = service.submit_generation(
++                OWNER,
++                client_task_id="cancel-task",
++                prompt="cat",
++                model="gpt-image-2",
++                size=None,
++                base_url="http://local.test",
++            )
++
++            self.assertTrue(started.wait(timeout=1.0))
++            running = wait_for_task(service, OWNER, "cancel-task", "running")
++            cancelled = service.cancel_task(ADMIN, created["key"])
++            self.assertEqual(running["status"], "running")
++            self.assertEqual(cancelled["status"], "cancelled")
++            self.assertEqual(cancelled["error"], "任务已取消")
++
++            release.set()
++            time.sleep(0.1)
++            result = service.list_tasks(OWNER, ["cancel-task"])
++            self.assertEqual(result["items"][0]["status"], "cancelled")
++            self.assertEqual(result["items"][0]["error"], "任务已取消")
++            self.assertNotIn("data", result["items"][0])
++
++            reloaded = self.make_service(path, handler)
++            persisted = reloaded.list_tasks(OWNER, ["cancel-task"])
++            self.assertEqual(persisted["items"][0]["status"], "cancelled")
++
++    def test_retry_error_task_reuses_original_payload(self):
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            path = Path(tmp_dir) / "image_tasks.json"
++            calls: list[dict[str, object]] = []
++            image_input = [(b"edit-image", "source.png", "image/png")]
++
++            def handler(payload):
++                calls.append(payload)
++                if len(calls) == 1:
++                    raise RuntimeError("boom")
++                return {"data": [{"url": "http://example.test/retried.png"}]}
++
++            service = self.make_service(path, handler)
++            created = service.submit_edit(
++                OWNER,
++                client_task_id="retry-task",
++                prompt="make it brighter",
++                model="gpt-image-2",
++                size="1024x1024",
++                base_url="http://local.test",
++                images=image_input,
++            )
++
++            wait_for_task(service, OWNER, "retry-task", "error")
++            queued = service.retry_task(ADMIN, created["key"], base_url="http://retry.test")
++            self.assertEqual(queued["status"], "queued")
++            retried = wait_for_task(service, OWNER, "retry-task", "success")
++
++            self.assertEqual(retried["data"][0]["url"], "http://example.test/retried.png")
++            self.assertEqual(len(calls), 2)
++            self.assertEqual(calls[1]["prompt"], "make it brighter")
++            self.assertEqual(calls[1]["model"], "gpt-image-2")
++            self.assertEqual(calls[1]["size"], "1024x1024")
++            self.assertEqual(calls[1]["base_url"], "http://retry.test")
++            self.assertEqual(calls[1]["images"], image_input)
+ 
+     def test_startup_marks_unfinished_tasks_as_error(self):
+         with tempfile.TemporaryDirectory() as tmp_dir:
+@@ -115,20 +199,40 @@ class ImageTaskServiceTests(unittest.TestCase):
+                     {
+                         "tasks": [
+                             {
++                                "key": "owner-1:queued-task",
+                                 "id": "queued-task",
+                                 "owner_id": "owner-1",
++                                "owner_name": "Owner",
++                                "owner_role": "user",
+                                 "status": "queued",
+                                 "mode": "generate",
+                                 "model": "gpt-image-2",
++                                "prompt": "cat",
++                                "request": {
++                                    "prompt": "cat",
++                                    "model": "gpt-image-2",
++                                    "size": "1024x1024",
++                                    "base_url": "http://local.test",
++                                },
+                                 "created_at": "2099-01-01 00:00:00",
+                                 "updated_at": "2099-01-01 00:00:00",
+                             },
+                             {
++                                "key": "owner-1:running-task",
+                                 "id": "running-task",
+                                 "owner_id": "owner-1",
++                                "owner_name": "Owner",
++                                "owner_role": "user",
+                                 "status": "running",
+                                 "mode": "generate",
+                                 "model": "gpt-image-2",
++                                "prompt": "dog",
++                                "request": {
++                                    "prompt": "dog",
++                                    "model": "gpt-image-2",
++                                    "size": "1024x1024",
++                                    "base_url": "http://local.test",
++                                },
+                                 "created_at": "2099-01-01 00:00:00",
+                                 "updated_at": "2099-01-01 00:00:00",
+                             },
+@@ -142,7 +246,9 @@ class ImageTaskServiceTests(unittest.TestCase):
+             result = service.list_tasks(OWNER, ["queued-task", "running-task"])
+ 
+             self.assertEqual([item["status"] for item in result["items"]], ["error", "error"])
+-            self.assertTrue(all("已中断" in item.get("error", "") for item in result["items"]))
++            self.assertIn("排队中的图片任务未继续执行", result["items"][0]["error"])
++            self.assertIn("运行中的图片任务已中断", result["items"][1]["error"])
++            self.assertTrue(all(item["status"] != "queued" and item["status"] != "running" for item in result["items"]))
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/test/test_image_tasks_api.py b/test/test_image_tasks_api.py
+index 9566fb7..5e6b5d8 100644
+--- a/test/test_image_tasks_api.py
++++ b/test/test_image_tasks_api.py
+@@ -29,13 +29,19 @@ class FakeImageTaskService:
+     def __init__(self):
+         self.generation_calls = []
+         self.edit_calls = []
++        self.cancel_calls = []
++        self.retry_calls = []
+ 
+     def submit_generation(self, identity, **kwargs):
+         self.generation_calls.append((identity, kwargs))
+         return {
++            "key": f"{identity['id']}:{kwargs['client_task_id']}",
+             "id": kwargs["client_task_id"],
++            "owner_id": identity["id"],
++            "owner_name": identity["name"],
+             "status": "success",
+             "mode": "generate",
++            "prompt": kwargs["prompt"],
+             "created_at": "2026-01-01 00:00:00",
+             "updated_at": "2026-01-01 00:00:00",
+             "data": [{"url": f"{kwargs['base_url']}/images/fake.png"}],
+@@ -44,20 +50,59 @@ class FakeImageTaskService:
+     def submit_edit(self, identity, **kwargs):
+         self.edit_calls.append((identity, kwargs))
+         return {
++            "key": f"{identity['id']}:{kwargs['client_task_id']}",
+             "id": kwargs["client_task_id"],
++            "owner_id": identity["id"],
++            "owner_name": identity["name"],
+             "status": "queued",
+             "mode": "edit",
++            "prompt": kwargs["prompt"],
++            "input_count": len(kwargs["images"]),
+             "created_at": "2026-01-01 00:00:00",
+             "updated_at": "2026-01-01 00:00:00",
+         }
+ 
+-    def list_tasks(self, _identity, ids):
++    def list_tasks(self, identity, ids):
++        if not ids and identity.get("role") == "admin":
++            return {
++                "items": [
++                    {
++                        "key": "owner-1:task-1",
++                        "id": "task-1",
++                        "owner_id": "owner-1",
++                        "owner_name": "Owner",
++                        "status": "running",
++                        "mode": "generate",
++                        "prompt": "cat",
++                        "created_at": "2026-01-01 00:00:00",
++                        "updated_at": "2026-01-01 00:00:00",
++                    },
++                    {
++                        "key": "owner-2:task-2",
++                        "id": "task-2",
++                        "owner_id": "owner-2",
++                        "owner_name": "Other",
++                        "status": "error",
++                        "mode": "edit",
++                        "prompt": "fix image",
++                        "input_count": 2,
++                        "error": "boom",
++                        "created_at": "2026-01-01 00:00:00",
++                        "updated_at": "2026-01-01 00:00:00",
++                    },
++                ],
++                "missing_ids": [],
++            }
+         return {
+             "items": [
+                 {
++                    "key": f"owner-1:{task_id}",
+                     "id": task_id,
++                    "owner_id": "owner-1",
++                    "owner_name": "Owner",
+                     "status": "success",
+                     "mode": "generate",
++                    "prompt": "cat",
+                     "created_at": "2026-01-01 00:00:00",
+                     "updated_at": "2026-01-01 00:00:00",
+                     "data": [{"url": "http://testserver/images/fake.png"}],
+@@ -68,6 +113,36 @@ class FakeImageTaskService:
+             "missing_ids": [task_id for task_id in ids if task_id == "missing"],
+         }
+ 
++    def cancel_task(self, identity, key):
++        self.cancel_calls.append((identity, key))
++        return {
++            "key": key,
++            "id": key.split(":", 1)[1],
++            "owner_id": key.split(":", 1)[0],
++            "owner_name": "Owner",
++            "status": "cancelled",
++            "mode": "generate",
++            "prompt": "cat",
++            "error": "任务已取消",
++            "created_at": "2026-01-01 00:00:00",
++            "updated_at": "2026-01-01 00:00:00",
++        }
++
++    def retry_task(self, identity, key, *, base_url):
++        self.retry_calls.append((identity, key, base_url))
++        return {
++            "key": key,
++            "id": key.split(":", 1)[1],
++            "owner_id": key.split(":", 1)[0],
++            "owner_name": "Owner",
++            "status": "queued",
++            "mode": "edit",
++            "prompt": "fix image",
++            "input_count": 2,
++            "created_at": "2026-01-01 00:00:00",
++            "updated_at": "2026-01-01 00:00:00",
++        }
++
+ 
+ class ImageTasksApiTests(unittest.TestCase):
+     def setUp(self):
+@@ -93,7 +168,6 @@ class ImageTasksApiTests(unittest.TestCase):
+         self.assertEqual(len(self.fake_service.generation_calls), 1)
+ 
+     def test_create_edit_task_accepts_multiple_images(self):
+-        """测试图片编辑任务接口支持多个上传图片。"""
+         response = self.client.post(
+             "/api/image-tasks/edits",
+             headers=AUTH_HEADERS,
+@@ -111,7 +185,6 @@ class ImageTasksApiTests(unittest.TestCase):
+         self.assertEqual(len(images), 2)
+ 
+     def test_create_edit_task_accepts_image_url(self):
+-        """测试图片编辑任务接口支持表单 image_url 引用。"""
+         response = self.client.post(
+             "/api/image-tasks/edits",
+             headers=AUTH_HEADERS,
+@@ -136,6 +209,31 @@ class ImageTasksApiTests(unittest.TestCase):
+         self.assertEqual([item["id"] for item in payload["items"]], ["task-1"])
+         self.assertEqual(payload["missing_ids"], ["missing"])
+ 
++    def test_list_tasks_returns_all_tasks_for_admin_without_ids(self):
++        response = self.client.get("/api/image-tasks", headers=AUTH_HEADERS)
++
++        self.assertEqual(response.status_code, 200, response.text)
++        payload = response.json()
++        self.assertEqual([item["key"] for item in payload["items"]], ["owner-1:task-1", "owner-2:task-2"])
++        self.assertEqual([item["status"] for item in payload["items"]], ["running", "error"])
++
++    def test_cancel_image_task(self):
++        response = self.client.post("/api/image-tasks/cancel", headers=AUTH_HEADERS, json={"key": "owner-1:task-1"})
++
++        self.assertEqual(response.status_code, 200, response.text)
++        payload = response.json()
++        self.assertEqual(payload["status"], "cancelled")
++        self.assertEqual(self.fake_service.cancel_calls[0][1], "owner-1:task-1")
++
++    def test_retry_image_task_uses_current_base_url(self):
++        response = self.client.post("/api/image-tasks/retry", headers=AUTH_HEADERS, json={"key": "owner-2:task-2"})
++
++        self.assertEqual(response.status_code, 200, response.text)
++        payload = response.json()
++        self.assertEqual(payload["status"], "queued")
++        self.assertEqual(self.fake_service.retry_calls[0][1], "owner-2:task-2")
++        self.assertEqual(self.fake_service.retry_calls[0][2], "http://testserver")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/uv.lock b/uv.lock
+index 29ac550..46dc367 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -1,5 +1,5 @@
+ version = 1
+-revision = 2
++revision = 3
+ requires-python = ">=3.13"
+ 
+ [[package]]
+@@ -143,45 +143,6 @@ wheels = [
+     { url = "https://mirrors.aliyun.com/pypi/packages/db/8f/61959034484a4a7c527811f4721e75d02d653a35afb0b6054474d8185d4c/charset_normalizer-3.4.7-py3-none-any.whl", hash = "sha256:3dce51d0f5e7951f8bb4900c257dad282f49190fdbebecd4ba99bcc41fef404d" },
+ ]
+ 
+-[[package]]
+-name = "webchat2api"
+-version = "0.0.7"
+-source = { virtual = "." }
+-dependencies = [
+-    { name = "curl-cffi" },
+-    { name = "fastapi" },
+-    { name = "gitpython" },
+-    { name = "pillow" },
+-    { name = "psycopg2-binary" },
+-    { name = "pybase64" },
+-    { name = "python-multipart" },
+-    { name = "sqlalchemy" },
+-    { name = "tiktoken" },
+-    { name = "uvicorn" },
+-]
+-
+-[package.dev-dependencies]
+-dev = [
+-    { name = "httpx" },
+-]
+-
+-[package.metadata]
+-requires-dist = [
+-    { name = "curl-cffi", specifier = ">=0.15.0" },
+-    { name = "fastapi", specifier = ">=0.136.0" },
+-    { name = "gitpython", specifier = ">=3.1.0" },
+-    { name = "pillow", specifier = ">=12.2.0" },
+-    { name = "psycopg2-binary", specifier = ">=2.9.0" },
+-    { name = "pybase64", specifier = ">=1.4.3" },
+-    { name = "python-multipart", specifier = ">=0.0.26" },
+-    { name = "sqlalchemy", specifier = ">=2.0.0" },
+-    { name = "tiktoken", specifier = ">=0.12.0" },
+-    { name = "uvicorn", specifier = ">=0.44.0" },
+-]
+-
+-[package.metadata.requires-dev]
+-dev = [{ name = "httpx", specifier = ">=0.28.1" }]
+-
+ [[package]]
+ name = "click"
+ version = "8.3.2"
+@@ -285,9 +246,7 @@ wheels = [
+     { url = "https://mirrors.aliyun.com/pypi/packages/7a/75/7e9cd1126a1e1f0cd67b0eda02e5221b28488d352684704a78ed505bd719/greenlet-3.4.0-cp313-cp313-macosx_11_0_universal2.whl", hash = "sha256:43748988b097f9c6f09364f260741aa73c80747f63389824435c7a50bfdfd5c1" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/9d/c4/3e2df392e5cb199527c4d9dbcaa75c14edcc394b45040f0189f649631e3c/greenlet-3.4.0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5566e4e2cd7a880e8c27618e3eab20f3494452d12fd5129edef7b2f7aa9a36d1" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/da/af/750cdfda1d1bd30a6c28080245be8d0346e669a98fdbae7f4102aa95fff3/greenlet-3.4.0-cp313-cp313-manylinux_2_24_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:1054c5a3c78e2ab599d452f23f7adafef55062a783a8e241d24f3b633ba6ff82" },
+-    { url = "https://mirrors.aliyun.com/pypi/packages/e0/93/c8c508d68ba93232784bbc1b5474d92371f2897dfc6bc281b419f2e0d492/greenlet-3.4.0-cp313-cp313-manylinux_2_24_s390x.manylinux_2_28_s390x.whl", hash = "sha256:98eedd1803353daf1cd9ef23eef23eda5a4d22f99b1f998d273a8b78b70dd47f" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/54/78/0cbc693622cd54ebe25207efbb3a0eb07c2639cb8594f6e3aaaa0bb077a8/greenlet-3.4.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f82cb6cddc27dd81c96b1506f4aa7def15070c3b2a67d4e46fd19016aacce6cf" },
+-    { url = "https://mirrors.aliyun.com/pypi/packages/7f/46/cfaaa0ade435a60550fd83d07dfd5c41f873a01da17ede5c4cade0b9bab8/greenlet-3.4.0-cp313-cp313-manylinux_2_39_riscv64.whl", hash = "sha256:b7857e2202aae67bc5725e0c1f6403c20a8ff46094ece015e7d474f5f7020b55" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/ba/c0/8966767de01343c1ff47e8b855dc78e7d1a8ed2b7b9c83576a57e289f81d/greenlet-3.4.0-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:227a46251ecba4ff46ae742bc5ce95c91d5aceb4b02f885487aff269c127a729" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/b8/38/bcdc71ba05e9a5fda87f63ffc2abcd1f15693b659346df994a48c968003d/greenlet-3.4.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:5b99e87be7eba788dd5b75ba1cde5639edffdec5f91fe0d734a249535ec3408c" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/a1/c2/19b664b7173b9e4ef5f77e8cef9f14c20ec7fce7920dc1ccd7afd955d093/greenlet-3.4.0-cp313-cp313-win_amd64.whl", hash = "sha256:849f8bc17acd6295fcb5de8e46d55cc0e52381c56eaf50a2afd258e97bc65940" },
+@@ -295,9 +254,7 @@ wheels = [
+     { url = "https://mirrors.aliyun.com/pypi/packages/78/02/bde66806e8f169cf90b14d02c500c44cdbe02c8e224c9c67bafd1b8cadd1/greenlet-3.4.0-cp314-cp314-macosx_11_0_universal2.whl", hash = "sha256:10a07aca6babdd18c16a3f4f8880acfffc2b88dfe431ad6aa5f5740759d7d75e" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/05/1f/39da1c336a87d47c58352fb8a78541ce63d63ae57c5b9dae1fe02801bbc2/greenlet-3.4.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:076e21040b3a917d3ce4ad68fb5c3c6b32f1405616c4a57aa83120979649bd3d" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/d3/6c/90ee29a4ee27af7aa2e2ec408799eeb69ee3fcc5abcecac6ddd07a5cd0f2/greenlet-3.4.0-cp314-cp314-manylinux_2_24_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:e82689eea4a237e530bb5cb41b180ef81fa2160e1f89422a67be7d90da67f615" },
+-    { url = "https://mirrors.aliyun.com/pypi/packages/d2/4a/74078d3936712cff6d3c91a930016f476ce4198d84e224fe6d81d3e02880/greenlet-3.4.0-cp314-cp314-manylinux_2_24_s390x.manylinux_2_28_s390x.whl", hash = "sha256:06c2d3b89e0c62ba50bd7adf491b14f39da9e7e701647cb7b9ff4c99bee04b19" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/07/49/d4cad6e5381a50947bb973d2f6cf6592621451b09368b8c20d9b8af49c5b/greenlet-3.4.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4df3b0b2289ec686d3c821a5fee44259c05cfe824dd5e6e12c8e5f5df23085cf" },
+-    { url = "https://mirrors.aliyun.com/pypi/packages/79/3e/df8a83ab894751bc31e1106fdfaa80ca9753222f106b04de93faaa55feb7/greenlet-3.4.0-cp314-cp314-manylinux_2_39_riscv64.whl", hash = "sha256:070b8bac2ff3b4d9e0ff36a0d19e42103331d9737e8504747cd1e659f76297bd" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/37/31/d1edd54f424761b5d47718822f506b435b6aab2f3f93b465441143ea5119/greenlet-3.4.0-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:8bff29d586ea415688f4cec96a591fcc3bf762d046a796cdadc1fdb6e7f2d5bf" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/b0/c6/6d3f9cdcb21c4e12a79cb332579f1c6aa1af78eb68059c5a957c7812d95e/greenlet-3.4.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:8a569c2fb840c53c13a2b8967c63621fafbd1a0e015b9c82f408c33d626a2fda" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/63/45/c1ca4a1ad975de4727e52d3ffe641ae23e1d7a8ffaa8ff7a0477e1827b92/greenlet-3.4.0-cp314-cp314-win_amd64.whl", hash = "sha256:207ba5b97ea8b0b60eb43ffcacf26969dd83726095161d676aac03ff913ee50d" },
+@@ -305,9 +262,7 @@ wheels = [
+     { url = "https://mirrors.aliyun.com/pypi/packages/d4/8f/18d72b629783f5e8d045a76f5325c1e938e659a9e4da79c7dcd10169a48d/greenlet-3.4.0-cp314-cp314t-macosx_11_0_universal2.whl", hash = "sha256:d70012e51df2dbbccfaf63a40aaf9b40c8bed37c3e3a38751c926301ce538ece" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/9e/ad/5fa86ec46769c4153820d58a04062285b3b9e10ba3d461ee257b68dcbf53/greenlet-3.4.0-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a58bec0751f43068cd40cff31bb3ca02ad6000b3a51ca81367af4eb5abc480c8" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/43/f0/4e8174ca0e87ae748c409f055a1ba161038c43cc0a5a6f1433a26ac2e5bf/greenlet-3.4.0-cp314-cp314t-manylinux_2_24_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:05fa0803561028f4b2e3b490ee41216a842eaee11aed004cc343a996d9523aa2" },
+-    { url = "https://mirrors.aliyun.com/pypi/packages/ef/92/466b0d9afd44b8af623139a3599d651c7564fa4152f25f117e1ee5949ffb/greenlet-3.4.0-cp314-cp314t-manylinux_2_24_s390x.manylinux_2_28_s390x.whl", hash = "sha256:c4cd56a9eb7a6444edbc19062f7b6fbc8f287c663b946e3171d899693b1c19fa" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/19/da/991cf7cd33662e2df92a1274b7eb4d61769294d38a1bba8a45f31364845e/greenlet-3.4.0-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e60d38719cb80b3ab5e85f9f1aed4960acfde09868af6762ccb27b260d68f4ed" },
+-    { url = "https://mirrors.aliyun.com/pypi/packages/0d/14/3395a7ef3e260de0325152ddfe19dffb3e49fe10873b94654352b53ad48e/greenlet-3.4.0-cp314-cp314t-manylinux_2_39_riscv64.whl", hash = "sha256:1f85f204c4d54134ae850d401fa435c89cd667d5ce9dc567571776b45941af72" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/36/c5/6c2c708e14db3d9caea4b459d8464f58c32047451142fe2cfd90e7458f41/greenlet-3.4.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:7f50c804733b43eded05ae694691c9aa68bca7d0a867d67d4a3f514742a2d53f" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/7a/4c/50c5fed19378e11a29fabab1f6be39ea95358f4a0a07e115a51ca93385d8/greenlet-3.4.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:2d4f0635dc4aa638cda4b2f5a07ae9a2cff9280327b581a3fcb6f317b4fbc38a" },
+     { url = "https://mirrors.aliyun.com/pypi/packages/db/72/85ae954d734703ab48e622c59d4ce35d77ce840c265814af9c078cacc7aa/greenlet-3.4.0-cp314-cp314t-win_amd64.whl", hash = "sha256:1a4a48f24681300c640f143ba7c404270e1ebbbcf34331d7104a4ff40f8ea705" },
+@@ -902,3 +857,42 @@ sdist = { url = "https://mirrors.aliyun.com/pypi/packages/5e/da/6eee1ff8b6cbeed4
+ wheels = [
+     { url = "https://mirrors.aliyun.com/pypi/packages/b7/23/a5bbd9600dd607411fa644c06ff4951bec3a4d82c4b852374024359c19c0/uvicorn-0.44.0-py3-none-any.whl", hash = "sha256:ce937c99a2cc70279556967274414c087888e8cec9f9c94644dfca11bd3ced89" },
+ ]
++
++[[package]]
++name = "webchat2api"
++version = "0.0.8"
++source = { virtual = "." }
++dependencies = [
++    { name = "curl-cffi" },
++    { name = "fastapi" },
++    { name = "gitpython" },
++    { name = "pillow" },
++    { name = "psycopg2-binary" },
++    { name = "pybase64" },
++    { name = "python-multipart" },
++    { name = "sqlalchemy" },
++    { name = "tiktoken" },
++    { name = "uvicorn" },
++]
++
++[package.dev-dependencies]
++dev = [
++    { name = "httpx" },
++]
++
++[package.metadata]
++requires-dist = [
++    { name = "curl-cffi", specifier = ">=0.15.0" },
++    { name = "fastapi", specifier = ">=0.136.0" },
++    { name = "gitpython", specifier = ">=3.1.0" },
++    { name = "pillow", specifier = ">=12.2.0" },
++    { name = "psycopg2-binary", specifier = ">=2.9.0" },
++    { name = "pybase64", specifier = ">=1.4.3" },
++    { name = "python-multipart", specifier = ">=0.0.26" },
++    { name = "sqlalchemy", specifier = ">=2.0.0" },
++    { name = "tiktoken", specifier = ">=0.12.0" },
++    { name = "uvicorn", specifier = ">=0.44.0" },
++]
++
++[package.metadata.requires-dev]
++dev = [{ name = "httpx", specifier = ">=0.28.1" }]
+diff --git a/web/src/app/image-manager/page.tsx b/web/src/app/image-manager/page.tsx
+index aa754d7..3f7f17d 100644
+--- a/web/src/app/image-manager/page.tsx
++++ b/web/src/app/image-manager/page.tsx
+@@ -13,7 +13,7 @@ import { Checkbox } from "@/components/ui/checkbox";
+ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+ import { Input } from "@/components/ui/input";
+ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+-import { deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageTags, fetchManagedImages, setImageTags, type ManagedImage } from "@/lib/api";
++import { cancelImageTask, deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageTags, fetchImageTasks, fetchManagedImages, retryImageTask, setImageTags, type ImageTask, type ManagedImage } from "@/lib/api";
+ import { useAuthGuard } from "@/lib/use-auth-guard";
+ 
+ const LONG_PRESS_MS = 800;
+@@ -36,6 +36,35 @@ function imageKey(item: ManagedImage) {
+   return item.rel || item.url;
+ }
+ 
++function taskStatusBadge(task: ImageTask) {
++  switch (task.status) {
++    case "queued":
++      return { label: "排队中", className: "border-stone-200 bg-stone-50 text-stone-700" };
++    case "running":
++      return { label: "执行中", className: "border-sky-200 bg-sky-50 text-sky-700" };
++    case "success":
++      return { label: "已完成", className: "border-emerald-200 bg-emerald-50 text-emerald-700" };
++    case "error":
++      return { label: "失败", className: "border-rose-200 bg-rose-50 text-rose-700" };
++    case "cancelled":
++      return { label: "已取消", className: "border-amber-200 bg-amber-50 text-amber-700" };
++    default:
++      return { label: task.status, className: "border-stone-200 bg-stone-50 text-stone-700" };
++  }
++}
++
++function canCancelTask(task: ImageTask) {
++  return task.status === "queued" || task.status === "running";
++}
++
++function canRetryTask(task: ImageTask) {
++  return task.status === "error";
++}
++
++function taskModeLabel(task: ImageTask) {
++  return task.mode === "edit" ? "图生图" : "文生图";
++}
++
+ function useLongPress(onLongPress: () => void, ms = LONG_PRESS_MS) {
+   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   const activeRef = useRef(false);
+@@ -85,6 +114,10 @@ function ImageManagerContent() {
+   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+   const [deleteMode, setDeleteMode] = useState<"selected" | "filtered" | null>(null);
+   const [isDownloading, setIsDownloading] = useState(false);
++  const [tasks, setTasks] = useState<ImageTask[]>([]);
++  const [isTaskLoading, setIsTaskLoading] = useState(true);
++  const [taskLoadError, setTaskLoadError] = useState("");
++  const [taskActionKey, setTaskActionKey] = useState("");
+ 
+   const filteredItems = selectedTags.length > 0
+     ? items.filter((item) => selectedTags.every((t) => (item.tags ?? []).includes(t)))
+@@ -123,6 +156,42 @@ function ImageManagerContent() {
+     }
+   };
+ 
++  const loadTasks = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
++    if (!silent) {
++      setIsTaskLoading(true);
++    }
++    try {
++      const data = await fetchImageTasks([]);
++      setTasks(data.items);
++      setTaskLoadError("");
++    } catch (error) {
++      const message = error instanceof Error ? error.message : "加载图片任务失败";
++      setTaskLoadError(message);
++      if (!silent) {
++        toast.error(message);
++      }
++    } finally {
++      if (!silent) {
++        setIsTaskLoading(false);
++      }
++    }
++  }, []);
++
++  const handleTaskAction = async (task: ImageTask, action: "cancel" | "retry") => {
++    const actionKey = `${action}:${task.key}`;
++    setTaskActionKey(actionKey);
++    try {
++      const nextTask = action === "cancel" ? await cancelImageTask(task.key) : await retryImageTask(task.key);
++      setTasks((current) => current.map((item) => item.key === nextTask.key ? nextTask : item));
++      toast.success(action === "cancel" ? "任务已取消" : "任务已重新加入队列");
++      await loadTasks({ silent: true });
++    } catch (error) {
++      toast.error(error instanceof Error ? error.message : action === "cancel" ? "取消任务失败" : "重试任务失败");
++    } finally {
++      setTaskActionKey("");
++    }
++  };
++
+   const closeDialog = useCallback(() => {
+     setDialogVisible(false);
+     setTimeout(() => setDeleteTarget(null), 200);
+@@ -265,6 +334,20 @@ function ImageManagerContent() {
+     void loadImages();
+   }, [startDate, endDate]);
+ 
++  useEffect(() => {
++    void loadTasks();
++  }, [loadTasks]);
++
++  useEffect(() => {
++    if (!tasks.some((task) => canCancelTask(task))) {
++      return;
++    }
++    const timer = window.setInterval(() => {
++      void loadTasks({ silent: true });
++    }, 3000);
++    return () => window.clearInterval(timer);
++  }, [loadTasks, tasks]);
++
+   return (
+     <section className="rounded-[28px] border border-white/70 bg-white/50 p-5 shadow-[var(--shadow-soft)] backdrop-blur-sm lg:p-6">
+       <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+@@ -288,8 +371,88 @@ function ImageManagerContent() {
+         </div>
+       </div>
+ 
++      <Card className="mt-4 overflow-hidden rounded-[26px] border-white/80 bg-white/86 shadow-[var(--shadow-soft)]">
++        <CardContent className="p-0">
++          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-100 px-5 py-4">
++            <div className="space-y-1">
++              <div className="text-sm font-medium text-stone-900">图片任务</div>
++              <div className="text-xs text-stone-500">
++                共 {tasks.length} 个任务
++                {tasks.some((task) => canCancelTask(task)) ? <span className="ml-2 text-sky-600">存在进行中的任务，页面会自动刷新</span> : null}
++              </div>
++            </div>
++            <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadTasks()} disabled={isTaskLoading || Boolean(taskActionKey)}>
++              <RefreshCw className={`size-4 ${isTaskLoading ? "animate-spin" : ""}`} />
++              刷新任务
++            </Button>
++          </div>
++          {taskLoadError ? <div className="border-b border-rose-100 bg-rose-50 px-5 py-3 text-sm text-rose-600">{taskLoadError}</div> : null}
++          {isTaskLoading ? (
++            <div className="flex items-center justify-center gap-2 px-5 py-8 text-sm text-stone-500">
++              <LoaderCircle className="size-4 animate-spin" />
++              正在加载图片任务
++            </div>
++          ) : tasks.length === 0 ? (
++            <div className="px-5 py-8 text-sm text-stone-500">暂无图片任务</div>
++          ) : (
++            <div className="max-h-[420px] divide-y divide-stone-100 overflow-y-auto">
++              {tasks.map((task) => {
++                const status = taskStatusBadge(task);
++                const isCancelling = taskActionKey === `cancel:${task.key}`;
++                const isRetrying = taskActionKey === `retry:${task.key}`;
++                return (
++                  <div key={task.key} className="flex flex-col gap-3 px-5 py-4 lg:flex-row lg:items-start lg:justify-between">
++                    <div className="min-w-0 space-y-2">
++                      <div className="flex flex-wrap items-center gap-2">
++                        <Badge variant="outline" className={`rounded-md px-2 py-0 text-[10px] ${status.className}`}>
++                          {status.label}
++                        </Badge>
++                        <Badge variant="outline" className="rounded-md px-2 py-0 text-[10px] text-stone-600">
++                          {taskModeLabel(task)}
++                        </Badge>
++                        <span className="text-xs text-stone-500">{task.owner_name || task.owner_id || "未知用户"}</span>
++                        <span className="text-xs text-stone-400">{task.id}</span>
++                      </div>
++                      <div className="text-sm font-medium text-stone-900">{task.prompt || "无提示词"}</div>
++                      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-stone-500">
++                        <span>模型：{task.model || "-"}</span>
++                        <span>尺寸：{task.size || "默认"}</span>
++                        <span>输入图：{task.input_count || 0}</span>
++                        <span>创建：{task.created_at}</span>
++                        <span>更新：{task.updated_at}</span>
++                      </div>
++                      {task.error ? <div className="text-xs text-rose-600">{task.error}</div> : null}
++                    </div>
++                    <div className="flex shrink-0 items-center gap-2">
++                      <Button
++                        variant="outline"
++                        className="h-8 rounded-lg border-amber-200 bg-white px-3 text-amber-700 hover:bg-amber-50"
++                        disabled={!canCancelTask(task) || Boolean(taskActionKey)}
++                        onClick={() => void handleTaskAction(task, "cancel")}
++                      >
++                        {isCancelling ? <LoaderCircle className="size-4 animate-spin" /> : <X className="size-4" />}
++                        取消任务
++                      </Button>
++                      <Button
++                        variant="outline"
++                        className="h-8 rounded-lg border-sky-200 bg-white px-3 text-sky-700 hover:bg-sky-50"
++                        disabled={!canRetryTask(task) || Boolean(taskActionKey)}
++                        onClick={() => void handleTaskAction(task, "retry")}
++                      >
++                        {isRetrying ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
++                        重试失败任务
++                      </Button>
++                    </div>
++                  </div>
++                );
++              })}
++            </div>
++          )}
++        </CardContent>
++      </Card>
++
+       {allTags.length > 0 ? (
+-        <div className="flex flex-wrap items-center gap-2">
++        <div className="mt-4 flex flex-wrap items-center gap-2">
+           <span className="text-xs font-medium text-stone-500">
+             <Tag className="mr-1 inline size-3.5" />
+             标签筛选：
+@@ -336,7 +499,7 @@ function ImageManagerContent() {
+         </div>
+       ) : null}
+ 
+-      <Card className="overflow-hidden rounded-[26px] border-white/80 bg-white/86 shadow-[var(--shadow-soft)]">
++      <Card className="mt-4 overflow-hidden rounded-[26px] border-white/80 bg-white/86 shadow-[var(--shadow-soft)]">
+         <CardContent className="p-0">
+           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-100 px-5 py-4">
+             <div className="flex flex-wrap items-center gap-3 text-sm text-stone-600">
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index ab2431f..5f8ec90 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -206,12 +206,20 @@ export type ImageResponse = {
+   data: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+ };
+ 
++export type ImageTaskStatus = "queued" | "running" | "success" | "error" | "cancelled";
++
+ export type ImageTask = {
++  key: string;
+   id: string;
+-  status: "queued" | "running" | "success" | "error";
++  owner_id?: string;
++  owner_name?: string;
++  owner_role?: string;
++  status: ImageTaskStatus;
+   mode: "generate" | "edit";
+   model?: ImageModel;
+   size?: string;
++  prompt?: string;
++  input_count?: number;
+   created_at: string;
+   updated_at: string;
+   data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+@@ -471,6 +479,20 @@ export async function fetchImageTasks(ids: string[]) {
+   return httpRequest<ImageTaskListResponse>(`/api/image-tasks${params.toString() ? `?${params.toString()}` : ""}`);
+ }
+ 
++export async function cancelImageTask(key: string) {
++  return httpRequest<ImageTask>("/api/image-tasks/cancel", {
++    method: "POST",
++    body: { key },
++  });
++}
++
++export async function retryImageTask(key: string) {
++  return httpRequest<ImageTask>("/api/image-tasks/retry", {
++    method: "POST",
++    body: { key },
++  });
++}
++
+ export async function fetchSettingsConfig() {
+   return httpRequest<{ config: SettingsConfig }>("/api/settings");
+ }

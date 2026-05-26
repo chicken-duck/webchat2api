@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -9,8 +10,9 @@ from pathlib import Path
 from services.image_task_service import ImageTaskService
 
 
-OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
+OWNER = {"id": "owner-1", "name": "Owner", "role": "user"}
 OTHER_OWNER = {"id": "owner-2", "name": "Other", "role": "user"}
+ADMIN = {"id": "admin", "name": "管理员", "role": "admin"}
 
 
 def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_id: str, status: str, timeout: float = 2.0):
@@ -86,26 +88,108 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(result["items"], [])
             self.assertEqual(result["missing_ids"], ["private-task"])
 
-    def test_success_task_persists_to_new_service_instance(self):
+    def test_admin_can_list_all_tasks(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            path = Path(tmp_dir) / "image_tasks.json"
-            service = self.make_service(path)
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
             service.submit_generation(
                 OWNER,
-                client_task_id="persisted-task",
+                client_task_id="owner-task",
                 prompt="cat",
                 model="gpt-image-2",
                 size=None,
                 base_url="http://local.test",
             )
-            wait_for_task(service, OWNER, "persisted-task", "success")
+            service.submit_generation(
+                OTHER_OWNER,
+                client_task_id="other-task",
+                prompt="dog",
+                model="gpt-image-2",
+                size="1024x1024",
+                base_url="http://local.test",
+            )
 
-            reloaded = self.make_service(path)
-            result = reloaded.list_tasks(OWNER, ["persisted-task"])
+            wait_for_task(service, OWNER, "owner-task", "success")
+            wait_for_task(service, OTHER_OWNER, "other-task", "success")
+            result = service.list_tasks(ADMIN, [])
 
+            self.assertEqual({item["id"] for item in result["items"]}, {"owner-task", "other-task"})
+            self.assertEqual({item["owner_id"] for item in result["items"]}, {"owner-1", "owner-2"})
             self.assertEqual(result["missing_ids"], [])
-            self.assertEqual(result["items"][0]["status"], "success")
-            self.assertEqual(result["items"][0]["data"][0]["url"], "http://example.test/image.png")
+
+    def test_cancel_running_task_persists_and_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            started = threading.Event()
+            release = threading.Event()
+
+            def handler(_payload):
+                started.set()
+                self.assertTrue(release.wait(timeout=1.0))
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            service = self.make_service(path, handler)
+            created = service.submit_generation(
+                OWNER,
+                client_task_id="cancel-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            self.assertTrue(started.wait(timeout=1.0))
+            running = wait_for_task(service, OWNER, "cancel-task", "running")
+            cancelled = service.cancel_task(ADMIN, created["key"])
+            self.assertEqual(running["status"], "running")
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertEqual(cancelled["error"], "任务已取消")
+
+            release.set()
+            time.sleep(0.1)
+            result = service.list_tasks(OWNER, ["cancel-task"])
+            self.assertEqual(result["items"][0]["status"], "cancelled")
+            self.assertEqual(result["items"][0]["error"], "任务已取消")
+            self.assertNotIn("data", result["items"][0])
+
+            reloaded = self.make_service(path, handler)
+            persisted = reloaded.list_tasks(OWNER, ["cancel-task"])
+            self.assertEqual(persisted["items"][0]["status"], "cancelled")
+
+    def test_retry_error_task_reuses_original_payload(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            calls: list[dict[str, object]] = []
+            image_input = [(b"edit-image", "source.png", "image/png")]
+
+            def handler(payload):
+                calls.append(payload)
+                if len(calls) == 1:
+                    raise RuntimeError("boom")
+                return {"data": [{"url": "http://example.test/retried.png"}]}
+
+            service = self.make_service(path, handler)
+            created = service.submit_edit(
+                OWNER,
+                client_task_id="retry-task",
+                prompt="make it brighter",
+                model="gpt-image-2",
+                size="1024x1024",
+                base_url="http://local.test",
+                images=image_input,
+            )
+
+            wait_for_task(service, OWNER, "retry-task", "error")
+            queued = service.retry_task(ADMIN, created["key"], base_url="http://retry.test")
+            self.assertEqual(queued["status"], "queued")
+            retried = wait_for_task(service, OWNER, "retry-task", "success")
+
+            self.assertEqual(retried["data"][0]["url"], "http://example.test/retried.png")
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[1]["prompt"], "make it brighter")
+            self.assertEqual(calls[1]["model"], "gpt-image-2")
+            self.assertEqual(calls[1]["size"], "1024x1024")
+            self.assertEqual(calls[1]["base_url"], "http://retry.test")
+            self.assertEqual(calls[1]["images"], image_input)
 
     def test_startup_marks_unfinished_tasks_as_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -115,20 +199,40 @@ class ImageTaskServiceTests(unittest.TestCase):
                     {
                         "tasks": [
                             {
+                                "key": "owner-1:queued-task",
                                 "id": "queued-task",
                                 "owner_id": "owner-1",
+                                "owner_name": "Owner",
+                                "owner_role": "user",
                                 "status": "queued",
                                 "mode": "generate",
                                 "model": "gpt-image-2",
+                                "prompt": "cat",
+                                "request": {
+                                    "prompt": "cat",
+                                    "model": "gpt-image-2",
+                                    "size": "1024x1024",
+                                    "base_url": "http://local.test",
+                                },
                                 "created_at": "2099-01-01 00:00:00",
                                 "updated_at": "2099-01-01 00:00:00",
                             },
                             {
+                                "key": "owner-1:running-task",
                                 "id": "running-task",
                                 "owner_id": "owner-1",
+                                "owner_name": "Owner",
+                                "owner_role": "user",
                                 "status": "running",
                                 "mode": "generate",
                                 "model": "gpt-image-2",
+                                "prompt": "dog",
+                                "request": {
+                                    "prompt": "dog",
+                                    "model": "gpt-image-2",
+                                    "size": "1024x1024",
+                                    "base_url": "http://local.test",
+                                },
                                 "created_at": "2099-01-01 00:00:00",
                                 "updated_at": "2099-01-01 00:00:00",
                             },
@@ -142,7 +246,9 @@ class ImageTaskServiceTests(unittest.TestCase):
             result = service.list_tasks(OWNER, ["queued-task", "running-task"])
 
             self.assertEqual([item["status"] for item in result["items"]], ["error", "error"])
-            self.assertTrue(all("已中断" in item.get("error", "") for item in result["items"]))
+            self.assertIn("排队中的图片任务未继续执行", result["items"][0]["error"])
+            self.assertIn("运行中的图片任务已中断", result["items"][1]["error"])
+            self.assertTrue(all(item["status"] != "queued" and item["status"] != "running" for item in result["items"]))
 
 
 if __name__ == "__main__":

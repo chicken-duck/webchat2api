@@ -13,7 +13,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageTags, fetchManagedImages, setImageTags, type ManagedImage } from "@/lib/api";
+import { cancelImageTask, deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageTags, fetchImageTasks, fetchManagedImages, retryImageTask, setImageTags, type ImageTask, type ManagedImage } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LONG_PRESS_MS = 800;
@@ -34,6 +34,35 @@ function formatSize(size: number) {
 
 function imageKey(item: ManagedImage) {
   return item.rel || item.url;
+}
+
+function taskStatusBadge(task: ImageTask) {
+  switch (task.status) {
+    case "queued":
+      return { label: "排队中", className: "border-stone-200 bg-stone-50 text-stone-700" };
+    case "running":
+      return { label: "执行中", className: "border-sky-200 bg-sky-50 text-sky-700" };
+    case "success":
+      return { label: "已完成", className: "border-emerald-200 bg-emerald-50 text-emerald-700" };
+    case "error":
+      return { label: "失败", className: "border-rose-200 bg-rose-50 text-rose-700" };
+    case "cancelled":
+      return { label: "已取消", className: "border-amber-200 bg-amber-50 text-amber-700" };
+    default:
+      return { label: task.status, className: "border-stone-200 bg-stone-50 text-stone-700" };
+  }
+}
+
+function canCancelTask(task: ImageTask) {
+  return task.status === "queued" || task.status === "running";
+}
+
+function canRetryTask(task: ImageTask) {
+  return task.status === "error";
+}
+
+function taskModeLabel(task: ImageTask) {
+  return task.mode === "edit" ? "图生图" : "文生图";
 }
 
 function useLongPress(onLongPress: () => void, ms = LONG_PRESS_MS) {
@@ -85,6 +114,10 @@ function ImageManagerContent() {
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [deleteMode, setDeleteMode] = useState<"selected" | "filtered" | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
+  const [tasks, setTasks] = useState<ImageTask[]>([]);
+  const [isTaskLoading, setIsTaskLoading] = useState(true);
+  const [taskLoadError, setTaskLoadError] = useState("");
+  const [taskActionKey, setTaskActionKey] = useState("");
 
   const filteredItems = selectedTags.length > 0
     ? items.filter((item) => selectedTags.every((t) => (item.tags ?? []).includes(t)))
@@ -120,6 +153,42 @@ function ImageManagerContent() {
       toast.error(error instanceof Error ? error.message : "加载图片失败");
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const loadTasks = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
+    if (!silent) {
+      setIsTaskLoading(true);
+    }
+    try {
+      const data = await fetchImageTasks([]);
+      setTasks(data.items);
+      setTaskLoadError("");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "加载图片任务失败";
+      setTaskLoadError(message);
+      if (!silent) {
+        toast.error(message);
+      }
+    } finally {
+      if (!silent) {
+        setIsTaskLoading(false);
+      }
+    }
+  }, []);
+
+  const handleTaskAction = async (task: ImageTask, action: "cancel" | "retry") => {
+    const actionKey = `${action}:${task.key}`;
+    setTaskActionKey(actionKey);
+    try {
+      const nextTask = action === "cancel" ? await cancelImageTask(task.key) : await retryImageTask(task.key);
+      setTasks((current) => current.map((item) => item.key === nextTask.key ? nextTask : item));
+      toast.success(action === "cancel" ? "任务已取消" : "任务已重新加入队列");
+      await loadTasks({ silent: true });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : action === "cancel" ? "取消任务失败" : "重试任务失败");
+    } finally {
+      setTaskActionKey("");
     }
   };
 
@@ -265,6 +334,20 @@ function ImageManagerContent() {
     void loadImages();
   }, [startDate, endDate]);
 
+  useEffect(() => {
+    void loadTasks();
+  }, [loadTasks]);
+
+  useEffect(() => {
+    if (!tasks.some((task) => canCancelTask(task))) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void loadTasks({ silent: true });
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [loadTasks, tasks]);
+
   return (
     <section className="rounded-[28px] border border-white/70 bg-white/50 p-5 shadow-[var(--shadow-soft)] backdrop-blur-sm lg:p-6">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
@@ -288,8 +371,88 @@ function ImageManagerContent() {
         </div>
       </div>
 
+      <Card className="mt-4 overflow-hidden rounded-[26px] border-white/80 bg-white/86 shadow-[var(--shadow-soft)]">
+        <CardContent className="p-0">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-100 px-5 py-4">
+            <div className="space-y-1">
+              <div className="text-sm font-medium text-stone-900">图片任务</div>
+              <div className="text-xs text-stone-500">
+                共 {tasks.length} 个任务
+                {tasks.some((task) => canCancelTask(task)) ? <span className="ml-2 text-sky-600">存在进行中的任务，页面会自动刷新</span> : null}
+              </div>
+            </div>
+            <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadTasks()} disabled={isTaskLoading || Boolean(taskActionKey)}>
+              <RefreshCw className={`size-4 ${isTaskLoading ? "animate-spin" : ""}`} />
+              刷新任务
+            </Button>
+          </div>
+          {taskLoadError ? <div className="border-b border-rose-100 bg-rose-50 px-5 py-3 text-sm text-rose-600">{taskLoadError}</div> : null}
+          {isTaskLoading ? (
+            <div className="flex items-center justify-center gap-2 px-5 py-8 text-sm text-stone-500">
+              <LoaderCircle className="size-4 animate-spin" />
+              正在加载图片任务
+            </div>
+          ) : tasks.length === 0 ? (
+            <div className="px-5 py-8 text-sm text-stone-500">暂无图片任务</div>
+          ) : (
+            <div className="max-h-[420px] divide-y divide-stone-100 overflow-y-auto">
+              {tasks.map((task) => {
+                const status = taskStatusBadge(task);
+                const isCancelling = taskActionKey === `cancel:${task.key}`;
+                const isRetrying = taskActionKey === `retry:${task.key}`;
+                return (
+                  <div key={task.key} className="flex flex-col gap-3 px-5 py-4 lg:flex-row lg:items-start lg:justify-between">
+                    <div className="min-w-0 space-y-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge variant="outline" className={`rounded-md px-2 py-0 text-[10px] ${status.className}`}>
+                          {status.label}
+                        </Badge>
+                        <Badge variant="outline" className="rounded-md px-2 py-0 text-[10px] text-stone-600">
+                          {taskModeLabel(task)}
+                        </Badge>
+                        <span className="text-xs text-stone-500">{task.owner_name || task.owner_id || "未知用户"}</span>
+                        <span className="text-xs text-stone-400">{task.id}</span>
+                      </div>
+                      <div className="text-sm font-medium text-stone-900">{task.prompt || "无提示词"}</div>
+                      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-stone-500">
+                        <span>模型：{task.model || "-"}</span>
+                        <span>尺寸：{task.size || "默认"}</span>
+                        <span>输入图：{task.input_count || 0}</span>
+                        <span>创建：{task.created_at}</span>
+                        <span>更新：{task.updated_at}</span>
+                      </div>
+                      {task.error ? <div className="text-xs text-rose-600">{task.error}</div> : null}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      <Button
+                        variant="outline"
+                        className="h-8 rounded-lg border-amber-200 bg-white px-3 text-amber-700 hover:bg-amber-50"
+                        disabled={!canCancelTask(task) || Boolean(taskActionKey)}
+                        onClick={() => void handleTaskAction(task, "cancel")}
+                      >
+                        {isCancelling ? <LoaderCircle className="size-4 animate-spin" /> : <X className="size-4" />}
+                        取消任务
+                      </Button>
+                      <Button
+                        variant="outline"
+                        className="h-8 rounded-lg border-sky-200 bg-white px-3 text-sky-700 hover:bg-sky-50"
+                        disabled={!canRetryTask(task) || Boolean(taskActionKey)}
+                        onClick={() => void handleTaskAction(task, "retry")}
+                      >
+                        {isRetrying ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                        重试失败任务
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       {allTags.length > 0 ? (
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="mt-4 flex flex-wrap items-center gap-2">
           <span className="text-xs font-medium text-stone-500">
             <Tag className="mr-1 inline size-3.5" />
             标签筛选：
@@ -336,7 +499,7 @@ function ImageManagerContent() {
         </div>
       ) : null}
 
-      <Card className="overflow-hidden rounded-[26px] border-white/80 bg-white/86 shadow-[var(--shadow-soft)]">
+      <Card className="mt-4 overflow-hidden rounded-[26px] border-white/80 bg-white/86 shadow-[var(--shadow-soft)]">
         <CardContent className="p-0">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-100 px-5 py-4">
             <div className="flex flex-wrap items-center gap-3 text-sm text-stone-600">

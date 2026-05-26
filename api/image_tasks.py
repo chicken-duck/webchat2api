@@ -5,7 +5,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
-from api.support import require_identity, resolve_image_base_url
+from api.support import require_admin, require_identity, resolve_image_base_url
 from services.content_filter import check_request
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
@@ -16,6 +16,10 @@ class ImageGenerationTaskRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     model: str = "gpt-image-2"
     size: str | None = None
+
+
+class ImageTaskActionRequest(BaseModel):
+    key: str = Field(..., min_length=1)
 
 
 def _parse_task_ids(value: str) -> list[str]:
@@ -87,6 +91,38 @@ def create_router() -> APIRouter:
                 base_url=resolve_image_base_url(request),
                 images=images,
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-tasks/cancel")
+    async def cancel_image_task(
+        body: ImageTaskActionRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_admin(authorization)
+        try:
+            return await run_in_threadpool(image_task_service.cancel_task, identity, body.key)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail={"error": str(exc.args[0])}) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-tasks/retry")
+    async def retry_image_task(
+        body: ImageTaskActionRequest,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_admin(authorization)
+        try:
+            return await run_in_threadpool(
+                image_task_service.retry_task,
+                identity,
+                body.key,
+                base_url=resolve_image_base_url(request),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail={"error": str(exc.args[0])}) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
