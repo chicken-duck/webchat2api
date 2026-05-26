@@ -41,6 +41,40 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         return await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids))
 
+    @router.get("/api/admin/image-tasks")
+    async def admin_list_image_tasks(
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            return await run_in_threadpool(image_task_service.list_all_tasks, identity)
+        except ValueError as exc:
+            raise HTTPException(status_code=403, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/admin/image-tasks/{task_id}/cancel")
+    async def admin_cancel_image_task(
+        task_id: str,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            return await run_in_threadpool(image_task_service.cancel_task, identity, task_id)
+        except ValueError as exc:
+            status_code = 403 if "only admin" in str(exc) else 400
+            raise HTTPException(status_code=status_code, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/admin/image-tasks/{task_id}/retry")
+    async def admin_retry_image_task(
+        task_id: str,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            return await run_in_threadpool(image_task_service.retry_task, identity, task_id)
+        except ValueError as exc:
+            status_code = 403 if "only admin" in str(exc) else 400
+            raise HTTPException(status_code=status_code, detail={"error": str(exc)}) from exc
+
     @router.post("/api/image-tasks/generations")
     async def create_generation_task(
         body: ImageGenerationTaskRequest,

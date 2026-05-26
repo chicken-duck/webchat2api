@@ -208,10 +208,12 @@ export type ImageResponse = {
 
 export type ImageTask = {
   id: string;
-  status: "queued" | "running" | "success" | "error";
+  owner_id?: string;
+  status: "queued" | "running" | "success" | "error" | "cancelled";
   mode: "generate" | "edit";
   model?: ImageModel;
   size?: string;
+  prompt?: string;
   created_at: string;
   updated_at: string;
   data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
@@ -469,6 +471,18 @@ export async function fetchImageTasks(ids: string[]) {
     params.set("ids", ids.join(","));
   }
   return httpRequest<ImageTaskListResponse>(`/api/image-tasks${params.toString() ? `?${params.toString()}` : ""}`);
+}
+
+export async function adminFetchImageTasks() {
+  return httpRequest<{ items: ImageTask[] }>("/api/admin/image-tasks");
+}
+
+export async function adminCancelImageTask(taskId: string) {
+  return httpRequest<ImageTask>(`/api/admin/image-tasks/${taskId}/cancel`, { method: "POST", body: {} });
+}
+
+export async function adminRetryImageTask(taskId: string) {
+  return httpRequest<ImageTask>(`/api/admin/image-tasks/${taskId}/retry`, { method: "POST", body: {} });
 }
 
 export async function fetchSettingsConfig() {

@@ -68,6 +68,21 @@ class FakeImageTaskService:
             "missing_ids": [task_id for task_id in ids if task_id == "missing"],
         }
 
+    def list_all_tasks(self, identity):
+        if identity.get("role") != "admin":
+            raise ValueError("only admin can list all tasks")
+        return {"items": [{"id": "task-1", "status": "success"}]}
+
+    def cancel_task(self, identity, task_id):
+        if identity.get("role") != "admin":
+            raise ValueError("only admin can cancel tasks")
+        return {"id": task_id, "status": "cancelled"}
+
+    def retry_task(self, identity, task_id):
+        if identity.get("role") != "admin":
+            raise ValueError("only admin can retry tasks")
+        return {"id": task_id, "status": "queued"}
+
 
 class ImageTasksApiTests(unittest.TestCase):
     def setUp(self):
@@ -135,6 +150,27 @@ class ImageTasksApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual([item["id"] for item in payload["items"]], ["task-1"])
         self.assertEqual(payload["missing_ids"], ["missing"])
+
+    def test_admin_list_all_tasks(self):
+        with mock.patch("api.image_tasks.require_identity") as mock_req:
+            mock_req.return_value = {"id": "1", "role": "admin"}
+            response = self.client.get("/api/admin/image-tasks", headers=AUTH_HEADERS)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["items"][0]["id"], "task-1")
+
+    def test_admin_cancel_task(self):
+        with mock.patch("api.image_tasks.require_identity") as mock_req:
+            mock_req.return_value = {"id": "1", "role": "admin"}
+            response = self.client.post("/api/admin/image-tasks/t-1/cancel", headers=AUTH_HEADERS)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["status"], "cancelled")
+
+    def test_admin_retry_task(self):
+        with mock.patch("api.image_tasks.require_identity") as mock_req:
+            mock_req.return_value = {"id": "1", "role": "admin"}
+            response = self.client.post("/api/admin/image-tasks/t-1/retry", headers=AUTH_HEADERS)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["status"], "queued")
 
 
 if __name__ == "__main__":

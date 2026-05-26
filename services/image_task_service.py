@@ -17,7 +17,8 @@ TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
-TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
+TASK_STATUS_CANCELLED = "cancelled"
+TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELLED}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 
 
@@ -64,10 +65,12 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
         "id": task.get("id"),
+        "owner_id": task.get("owner_id"),
         "status": task.get("status"),
         "mode": task.get("mode"),
         "model": task.get("model"),
         "size": task.get("size"),
+        "prompt": task.get("prompt"),
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
@@ -167,6 +170,77 @@ class ImageTaskService:
                 missing_ids = []
             return {"items": items, "missing_ids": missing_ids}
 
+    def list_all_tasks(self, identity: dict[str, object]) -> dict[str, Any]:
+        if identity.get("role") != "admin":
+            raise ValueError("only admin can list all tasks")
+        with self._lock:
+            if self._cleanup_locked():
+                self._save_locked()
+            items = [_public_task(task) for task in self._tasks.values()]
+            items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+            return {"items": items}
+
+    def cancel_task(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        if identity.get("role") != "admin":
+            raise ValueError("only admin can cancel tasks")
+        with self._lock:
+            target_key = None
+            for key, task in self._tasks.items():
+                if task.get("id") == task_id:
+                    target_key = key
+                    break
+            if not target_key:
+                raise ValueError("task not found")
+            task = self._tasks[target_key]
+            if task.get("status") in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}:
+                task["status"] = TASK_STATUS_CANCELLED
+                task["updated_at"] = _now_iso()
+                self._save_locked()
+            return _public_task(task)
+
+    def retry_task(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        if identity.get("role") != "admin":
+            raise ValueError("only admin can retry tasks")
+        with self._lock:
+            target_key = None
+            for key, task in self._tasks.items():
+                if task.get("id") == task_id:
+                    target_key = key
+                    break
+            if not target_key:
+                raise ValueError("task not found")
+            task = self._tasks[target_key]
+            if task.get("status") != TASK_STATUS_ERROR:
+                raise ValueError("only error tasks can be retried")
+            original_payload = task.get("_original_payload")
+            if not original_payload:
+                raise ValueError("original payload not found, cannot retry")
+            
+            payload = {}
+            for k, v in original_payload.items():
+                if k == "images":
+                    decoded_images = []
+                    for b64, name, mime in v:
+                        import base64
+                        decoded_images.append((base64.b64decode(b64), name, mime))
+                    payload[k] = decoded_images
+                else:
+                    payload[k] = v
+
+            task["status"] = TASK_STATUS_QUEUED
+            task["error"] = ""
+            task["updated_at"] = _now_iso()
+            self._save_locked()
+
+            thread = threading.Thread(
+                target=self._run_task,
+                args=(target_key, task.get("mode", "generate"), payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
+                name=f"image-task-{task_id[:16]}",
+                daemon=True,
+            )
+            thread.start()
+            return _public_task(task)
+
     def _submit(
         self,
         identity: dict[str, object],
@@ -189,6 +263,18 @@ class ImageTaskService:
                 if cleaned:
                     self._save_locked()
                 return _public_task(task)
+            
+            serializable_payload = {}
+            for k, v in payload.items():
+                if k == "images":
+                    encoded_images = []
+                    for img_bytes, img_name, img_mime in v:
+                        import base64
+                        encoded_images.append((base64.b64encode(img_bytes).decode("ascii"), img_name, img_mime))
+                    serializable_payload[k] = encoded_images
+                else:
+                    serializable_payload[k] = v
+
             task = {
                 "id": task_id,
                 "owner_id": owner,
@@ -196,8 +282,10 @@ class ImageTaskService:
                 "mode": mode,
                 "model": _clean(payload.get("model"), "gpt-image-2"),
                 "size": _clean(payload.get("size")),
+                "prompt": _clean(payload.get("prompt")),
                 "created_at": now,
                 "updated_at": now,
+                "_original_payload": serializable_payload,
             }
             self._tasks[key] = task
             self._save_locked()
@@ -221,6 +309,11 @@ class ImageTaskService:
         identity: dict[str, object],
         model: str,
     ) -> None:
+        with self._lock:
+            task = self._tasks.get(key)
+            if task and task.get("status") == TASK_STATUS_CANCELLED:
+                return
+
         started = time.time()
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
         try:
@@ -302,6 +395,8 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if task is None:
                 return
+            if task.get("status") == TASK_STATUS_CANCELLED and updates.get("status") in {TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}:
+                return
             task.update(updates)
             task["updated_at"] = _now_iso()
             self._save_locked()
@@ -325,7 +420,7 @@ class ImageTaskService:
             if not task_id or not owner:
                 continue
             status = _clean(item.get("status"))
-            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}:
+            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELLED}:
                 status = TASK_STATUS_ERROR
             task = {
                 "id": task_id,
@@ -334,9 +429,13 @@ class ImageTaskService:
                 "mode": "edit" if item.get("mode") == "edit" else "generate",
                 "model": _clean(item.get("model"), "gpt-image-2"),
                 "size": _clean(item.get("size")),
+                "prompt": _clean(item.get("prompt")),
                 "created_at": _clean(item.get("created_at"), _now_iso()),
                 "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
             }
+            original_payload = item.get("_original_payload")
+            if isinstance(original_payload, dict):
+                task["_original_payload"] = original_payload
             data = item.get("data")
             if isinstance(data, list):
                 task["data"] = data

@@ -144,6 +144,65 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual([item["status"] for item in result["items"]], ["error", "error"])
             self.assertTrue(all("已中断" in item.get("error", "") for item in result["items"]))
 
+    def test_cancel_task_updates_status(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            def handler(_payload):
+                time.sleep(0.5)
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            task = service.submit_generation(
+                OWNER,
+                client_task_id="task-cancel",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            self.assertEqual(task["status"], "queued")
+            
+            # Cancel immediately
+            canceled = service.cancel_task(OWNER, "task-cancel")
+            self.assertEqual(canceled["status"], "cancelled")
+
+            time.sleep(0.1) # allow thread to try start
+            
+            result = service.list_tasks(OWNER, ["task-cancel"])
+            self.assertEqual(result["items"][0]["status"], "cancelled")
+
+    def test_retry_task_restarts_execution(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            calls = 0
+
+            def handler(_payload):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("first time fail")
+                return {"data": [{"url": "http://example.test/success.png"}]}
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_generation(
+                OWNER,
+                client_task_id="task-retry",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            
+            # Wait for it to fail
+            failed = wait_for_task(service, OWNER, "task-retry", "error")
+            self.assertEqual(failed["error"], "first time fail")
+
+            # Retry
+            retried = service.retry_task(OWNER, "task-retry")
+            self.assertEqual(retried["status"], "queued")
+            
+            # Wait for success
+            success = wait_for_task(service, OWNER, "task-retry", "success")
+            self.assertEqual(success["data"][0]["url"], "http://example.test/success.png")
+
 
 if __name__ == "__main__":
     unittest.main()

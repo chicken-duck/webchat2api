@@ -16,6 +16,8 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageTags, fetchManagedImages, setImageTags, type ManagedImage } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
+import { ImageTasksContent } from "./ImageTasksContent";
+
 const LONG_PRESS_MS = 800;
 
 function storageBadge(item: ManagedImage) {
@@ -633,8 +635,28 @@ function ImageManagerContent() {
 
 export default function ImageManagerPage() {
   const { isCheckingAuth, session } = useAuthGuard(["admin"]);
+  const [activeTab, setActiveTab] = useState<"images" | "tasks">("images");
+
   if (isCheckingAuth || !session || session.role !== "admin") {
     return <div className="flex min-h-[40vh] items-center justify-center"><LoaderCircle className="size-5 animate-spin text-stone-400" /></div>;
   }
-  return <ImageManagerContent />;
+  return (
+    <div className="space-y-4">
+      <div className="flex gap-2 p-1 bg-white/50 rounded-xl w-fit border border-white/70 shadow-[var(--shadow-soft)] backdrop-blur-sm">
+        <button 
+          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${activeTab === "images" ? "bg-stone-900 text-white" : "text-stone-600 hover:bg-white/60"}`}
+          onClick={() => setActiveTab("images")}
+        >
+          图片列表
+        </button>
+        <button 
+          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${activeTab === "tasks" ? "bg-stone-900 text-white" : "text-stone-600 hover:bg-white/60"}`}
+          onClick={() => setActiveTab("tasks")}
+        >
+          任务列表
+        </button>
+      </div>
+      {activeTab === "images" ? <ImageManagerContent /> : <ImageTasksContent />}
+    </div>
+  );
 }
